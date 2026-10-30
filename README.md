@@ -19,3 +19,24 @@ To update an existing Native Studio installation, close the editor and select it
 
 Character contours follow the animated surface and exclude the mouth interior. Speech blends original mouth poses smoothly using the same time-based curve for playback, timeline seeking, and video export.
 
+## Import your own characters
+
+The installer includes GLB 2.0 character import and automatic basic character setup in the native Windows editor. No plug-in, cloud upload, or browser is needed.
+
+1. Click **Import model** and choose a **.glb** with embedded PNG/JPEG textures. Export without Draco, Meshopt, or KTX2 compression.
+2. Preview your character and save it to **My models**. Body-part mappings are optional, under **Advanced mappings**.
+3. Click **Add to scene**. Selecting a library item only previews it.
+4. Use **Direct** for walking, waving, looking around, nodding, talking gestures, and embedded animation clips.
+5. Choose **Talk** or **Custom audio**, import a sound and add it to the character's voice track. Audio attachment works even if mouth animation is disabled.
+
+Existing skeletons and mouth shapes take priority. When these are absent, the editor estimates a simple movement rig from the model's proportions and adds a stylized speech mouth on its surface. This is a geometric approximation for upright characters facing forward, not universal anatomical recognition. Unusual shapes, poses, or orientations can need adjustment; the automatic body and mouth can be switched off in the import preview. Models with an authored rig and facial shapes give more accurate results.
+
+The renderer uses base-color textures/materials; advanced PBR effects are not reproduced. Bake varying vertex colors into the base-color texture before export. The limit is 128 MB per model and 250,000 source vertices; smaller models are recommended for smooth editing.
+
+Imported GLB data and character settings are included when you save a .ttnative project. Your model library is stored in your Windows user profile and survives editor updates. Existing imported models get the automatic fallback when reopening them in the updated editor. Imported user models are not included in this GitHub package.
+
+## Scene editing
+
+Select an item in **In your scene** and press **Delete**, or use the **Delete** button below the list. This removes the actor/prop/background from the current scene and removes its attached actions, voice clips, and position keys. The library model and source audio files are kept. Unrelated music stays on the timeline.
+
+**Add to scene** adds the selected character or prop as an independent object; selecting a background replaces the active background. Browsing only previews the selection, and leaving Prep restores the committed scene and camera. Adding characters or props preserves the background camera. Asset cards remain selectable as their thumbnails load; searching first is not required.
