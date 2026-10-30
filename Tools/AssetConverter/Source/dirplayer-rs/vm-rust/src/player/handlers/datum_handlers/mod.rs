@@ -1,0 +1,469 @@
+pub mod bitmap;
+pub mod cast_lib;
+pub mod cast_member;
+pub mod cast_member_ref;
+pub mod color;
+pub mod date;
+pub mod int;
+pub mod js_object;
+pub mod list_handlers;
+pub mod math;
+pub mod player;
+pub mod point;
+pub mod prop_list;
+pub mod rect;
+pub mod script;
+pub mod script_instance;
+pub mod sound_channel;
+pub mod sprite;
+pub mod string;
+pub mod string_chunk;
+pub mod symbol;
+pub mod timeout;
+pub mod vector;
+pub mod void;
+pub mod xml;
+pub mod flash_object;
+pub mod float;
+pub mod shockwave3d_object;
+pub mod transform3d;
+pub mod havok_object;
+pub mod physx_object;
+
+use player::PlayerDatumHandlers;
+use self::flash_object::FlashObjectDatumHandlers;
+
+use self::cast_lib::CastLibDatumHandlers;
+use self::date::DateDatumHandlers;
+use self::math::MathDatumHandlers;
+use self::vector::VectorDatumHandlers;
+use self::void::VoidDatumHandlers;
+use self::xml::XmlDatumHandlers;
+use self::{
+    bitmap::BitmapDatumHandlers, list_handlers::ListDatumHandlers, point::PointDatumHandlers,
+    prop_list::PropListDatumHandlers, rect::RectDatumHandlers, script::ScriptDatumHandlers,
+    sound_channel::SoundChannelDatumHandlers, sprite::SpriteDatumHandlers,
+    string::StringDatumHandlers, string_chunk::StringChunkHandlers, timeout::TimeoutDatumHandlers,
+};
+use std::collections::VecDeque;
+
+use crate::player::symbols::builtin::BuiltInSymbol;
+use crate::player::symbols::symbol::Symbol;
+use crate::{
+    director::lingo::datum::DatumType,
+    player::{
+        format_datum, reserve_player_mut, reserve_player_ref,
+        xtra::manager::{
+            call_xtra_instance_async_handler, call_xtra_instance_handler,
+            has_xtra_instance_async_handler,
+        },
+        DatumRef, ScriptError, ScriptErrorCode,
+    },
+};
+
+pub async fn player_call_datum_handler(
+    obj_ref: &DatumRef,
+    handler_name: Symbol,
+    args: &Vec<DatumRef>,
+) -> Result<DatumRef, ScriptError> {
+    // Track handler depth
+    reserve_player_mut(|player| {
+        player.handler_stack_depth += 1;
+    });
+   
+    // Block recursive getPropertyDescriptionList calls
+    if handler_name == BuiltInSymbol::GetPropertyDescriptionList {
+        let should_skip = reserve_player_mut(|player| {
+            if player.is_getting_property_descriptions {
+                web_sys::console::warn_1(&"BLOCKED recursive getPropertyDescriptionList".into());
+                true
+            } else {
+                player.is_getting_property_descriptions = true;
+                false
+            }
+        });
+        
+        if should_skip {
+            // Decrement handler depth before returning
+            reserve_player_mut(|player| {
+                player.handler_stack_depth = player.handler_stack_depth.saturating_sub(1);
+            });
+            
+            // Return empty property list
+            web_sys::console::warn_1(&"Returning empty property list to prevent recursion".into());
+            return reserve_player_mut(|player| {
+                Ok(player.alloc_datum(crate::director::lingo::datum::Datum::PropList(VecDeque::new(), false)))
+            });
+        }
+    }
+
+    let datum_type = reserve_player_ref(|player| player.get_datum(obj_ref).type_enum());
+
+    // let profile_token = start_profiling(format!("{}::{}", datum_type.type_str(), handler_name));
+    let result = match datum_type {
+        DatumType::List => ListDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::XmlChildNodes => ListDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::PropList => PropListDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::String => StringDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::StringChunk => StringChunkHandlers::call(obj_ref, handler_name, args),
+        DatumType::ScriptRef => {
+            if ScriptDatumHandlers::has_async_handler(obj_ref, handler_name) {
+                ScriptDatumHandlers::call_async(obj_ref, handler_name, args).await
+            } else {
+                ScriptDatumHandlers::call(obj_ref, handler_name, args)
+            }
+        }
+        DatumType::ScriptInstanceRef => {
+            if script_instance::ScriptInstanceDatumHandlers::has_async_handler(
+                obj_ref,
+                handler_name,
+            )? {
+                script_instance::ScriptInstanceDatumHandlers::call_async(
+                    obj_ref,
+                    handler_name,
+                    args,
+                )
+                .await
+            } else {
+                script_instance::ScriptInstanceDatumHandlers::call(obj_ref, handler_name, args)
+            }
+        }
+        DatumType::TimeoutRef | DatumType::TimeoutInstance | DatumType::TimeoutFactory => {
+            if TimeoutDatumHandlers::has_async_handler(handler_name) {
+                TimeoutDatumHandlers::call_async(obj_ref, handler_name, args).await
+            } else {
+                TimeoutDatumHandlers::call(obj_ref, handler_name, args)
+            }
+        }
+        DatumType::CastMemberRef => {
+            if cast_member_ref::CastMemberRefHandlers::has_async_handler(obj_ref, handler_name) {
+                cast_member_ref::CastMemberRefHandlers::call_async(obj_ref, handler_name, args).await
+            } else {
+                cast_member_ref::CastMemberRefHandlers::call(obj_ref, handler_name, args)
+            }
+        }
+        DatumType::Rect => RectDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::Point => PointDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::BitmapRef => BitmapDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::SpriteRef => {
+            if SpriteDatumHandlers::has_async_handler(obj_ref, handler_name.as_str())? {
+                SpriteDatumHandlers::call_async(obj_ref.clone(), handler_name, args).await
+            } else {
+                SpriteDatumHandlers::call(obj_ref, handler_name.as_str(), args)
+            }
+        }
+        DatumType::Xtra => {
+            // xtra("name").new() — create an instance via method call on the Xtra class datum
+            if handler_name == BuiltInSymbol::New {
+                let mut full_args = vec![obj_ref.clone()];
+                full_args.extend(args.iter().cloned());
+                Box::pin(crate::player::handlers::types::TypeHandlers::new(&full_args)).await
+            } else {
+                Err(ScriptError::new_code(
+                    ScriptErrorCode::HandlerNotFound,
+                    format!("No handler {handler_name} for Xtra datum"),
+                ))
+            }
+        }
+        DatumType::XtraInstance => {
+            let (xtra_name, instance_id) = reserve_player_ref(|player| {
+                let (xtra_name, instance_id) =
+                    player.get_datum(obj_ref).to_xtra_instance().unwrap();
+                (xtra_name.to_owned(), instance_id.clone())
+            });
+            if has_xtra_instance_async_handler(&xtra_name, handler_name.as_str(), instance_id) {
+                call_xtra_instance_async_handler(&xtra_name, instance_id, handler_name.as_str(), args).await
+            } else {
+                call_xtra_instance_handler(&xtra_name, instance_id, handler_name.as_str(), args)
+            }
+        }
+        DatumType::ColorRef => color::ColorDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::PlayerRef => PlayerDatumHandlers::call(handler_name, args),
+        DatumType::XmlRef => XmlDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::JsObjectRef => {
+            js_object::JsObjectDatumHandlers::call(obj_ref, handler_name, args)
+        }
+        DatumType::DateRef => DateDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::MathRef => MathDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::Vector => VectorDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::SoundChannel => reserve_player_mut(|player| {
+            SoundChannelDatumHandlers::call(player, obj_ref, handler_name, args)
+        }),
+        DatumType::CastLibRef => CastLibDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::MovieRef => {
+            match handler_name.into_builtin() {
+                Some(BuiltInSymbol::NewMember) => {
+                    Box::pin(crate::player::handlers::types::TypeHandlers::new(&args.clone())).await
+                }
+                Some(BuiltInSymbol::Go) => {
+                    Box::pin(crate::player::handlers::movie::MovieHandlers::go(&args)).await
+                }
+                Some(BuiltInSymbol::Count) => {
+                    reserve_player_mut(|player| {
+                        use crate::director::lingo::datum::Datum;
+                        let prop_name = player.get_datum(&args[0]).symbol_value()?;
+                        // `_movie.castLib` is a COLLECTION — Director 11.5 Scripting
+                        // Dictionary, `castLib` (Movie property, read-only):
+                        // "provides named or indexed access to the cast libraries of a
+                        // movie". It can't be built in `Movie::get_prop` (no allocator
+                        // there), so answer the collection queries here, where the
+                        // player is in hand. AreaZero's `[M] Cast.GetInternalCasts`
+                        // opens with `tCount = _movie.castLib.count`.
+                        if prop_name.eq_ignore_ascii_case("castLib") {
+                            let count = player.movie.cast_manager.casts.len() as i32;
+                            return Ok(player.alloc_datum(Datum::Int(count)));
+                        }
+                        if prop_name.eq_ignore_ascii_case("markerList") {
+                            let count = player.movie.score.frame_labels.len() as i32;
+                            return Ok(player.alloc_datum(Datum::Int(count)));
+                        }
+                        // Collection queries must see the PLAYER-level movie props too.
+                        // `Movie::get_prop` covers only plain scalar properties; the
+                        // list-valued ones — `markerList` (Director 11.5: "a script
+                        // property list of the markers in the Score", frameNumber:
+                        // "markerName") and `xtraList` — are built in
+                        // `DirPlayer::get_movie_prop`, which needs the allocator. Try the
+                        // plain getter first, then fall back. AreaZero's `[M] Misc.goto`
+                        // opens with `_movie.markerList.count`, which previously raised
+                        // "Cannot get movie prop markerlist" even though markerList was
+                        // implemented — it just wasn't reachable from _movie.
+                        let prop_datum = match player.movie.get_prop(prop_name) {
+                            Ok(d) => d,
+                            Err(_) => {
+                                let r = player.get_movie_prop(prop_name)?;
+                                player.get_datum(&r).clone()
+                            }
+                        };
+                        let count = match &prop_datum {
+                            Datum::List(_, items, _) => items.len() as i32,
+                            Datum::PropList(items, _) => items.len() as i32,
+                            _ => 0,
+                        };
+                        Ok(player.alloc_datum(Datum::Int(count)))
+                    })
+                }
+                Some(BuiltInSymbol::GetProp | BuiltInSymbol::GetAt | BuiltInSymbol::GetPropRef) => {
+                    // _system.desktopRectList[1] → getProp(desktopRectList, 1)
+                    reserve_player_mut(|player| {
+                        use crate::director::lingo::datum::Datum;
+                        let prop_name = player.get_datum(&args[0]).symbol_value()?;
+                        // `_movie.castLib[castNameOrNum]` — the dictionary's documented
+                        // form takes "either a string that specifies the name ... or an
+                        // integer that specifies the number". Resolve both to the same
+                        // castLib reference the top-level `castLib()` yields.
+                        if prop_name.eq_ignore_ascii_case("castLib") && args.len() > 1 {
+                            let key = player.get_datum(&args[1]).clone();
+                            let number = match &key {
+                                Datum::String(name) => player
+                                    .movie
+                                    .cast_manager
+                                    .casts
+                                    .iter()
+                                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                                    .map(|c| c.number as u32),
+                                _ => key.int_value().ok().map(|n| n as u32),
+                            };
+                            return Ok(match number {
+                                Some(n) => player.alloc_datum(Datum::CastLib(n)),
+                                None => DatumRef::Void,
+                            });
+                        }
+                        // Collection queries must see the PLAYER-level movie props too.
+                        // `Movie::get_prop` covers only plain scalar properties; the
+                        // list-valued ones — `markerList` (Director 11.5: "a script
+                        // property list of the markers in the Score", frameNumber:
+                        // "markerName") and `xtraList` — are built in
+                        // `DirPlayer::get_movie_prop`, which needs the allocator. Try the
+                        // plain getter first, then fall back. AreaZero's `[M] Misc.goto`
+                        // opens with `_movie.markerList.count`, which previously raised
+                        // "Cannot get movie prop markerlist" even though markerList was
+                        // implemented — it just wasn't reachable from _movie.
+                        let prop_datum = match player.movie.get_prop(prop_name) {
+                            Ok(d) => d,
+                            Err(_) => {
+                                let r = player.get_movie_prop(prop_name)?;
+                                player.get_datum(&r).clone()
+                            }
+                        };
+                        let prop_ref = player.alloc_datum(prop_datum);
+                        if args.len() > 1 {
+                            let list_datum = player.get_datum(&prop_ref).clone();
+                            match list_datum {
+                                Datum::List(_, items, _) => {
+                                    let index = player.get_datum(&args[1]).int_value()?;
+                                    let idx = (index as usize).saturating_sub(1);
+                                    if idx < items.len() {
+                                        Ok(items[idx].clone())
+                                    } else {
+                                        Ok(DatumRef::Void)
+                                    }
+                                }
+                                // A PROPERTY-list movie prop must index too. `markerList`
+                                // is the one that matters (Director 11.5: "a script
+                                // property list of the markers in the Score",
+                                // frameNumber: "markerName"), and it was falling into the
+                                // catch-all below — so `_movie.markerList[i]` handed back
+                                // the WHOLE list for every i, index silently discarded.
+                                //
+                                // AreaZero's `[M] Misc.goto` walks the markers to
+                                // validate a name before jumping:
+                                //     repeat with i = 1 to _movie.markerlist.count
+                                //       tListMarker = _movie.markerlist[i]
+                                //       if tMarker = tListMarker then exit repeat
+                                //       if (i = _movie.markerlist.count) and ... then
+                                //         tMarker = #none
+                                // Comparing "Game" against the whole list never matched,
+                                // so the marker was nulled and `_movie.go("Game")` never
+                                // ran. The movie stayed on frame 1 — whose score script
+                                // is a bare `go the frame` with no enterFrame handler —
+                                // so its per-frame script manager never ticked and the
+                                // menu sat frozen.
+                                //
+                                // PropListUtils::get_at applies Director's rule: an
+                                // integer indexes positionally, anything else is a key
+                                // lookup.
+                                Datum::PropList(pairs, pairs_sorted) => {
+                                    crate::player::handlers::datum_handlers::prop_list::PropListUtils::get_at(
+                                        &pairs, &args[1], &player.allocator, pairs_sorted,
+                                    )
+                                }
+                                _ => Ok(prop_ref)
+                            }
+                        } else {
+                            Ok(prop_ref)
+                        }
+                    })
+                }
+                // The Movie object's method surface mirrors Director's global
+                // command surface — `_movie.updateStage()` and `updateStage()`
+                // are the same call (Director 11.5 Scripting Dictionary shows
+                // both forms for updateStage, puppetSprite, stopEvent, preLoad,
+                // …). Rather than re-listing each one here, fall through to the
+                // built-in dispatcher; only a name it doesn't know is an error.
+                _ => {
+                    use crate::player::handlers::manager::BuiltInHandlerManager;
+                    if BuiltInHandlerManager::has_async_handler(handler_name) {
+                        Box::pin(BuiltInHandlerManager::call_async_handler(handler_name, &args))
+                            .await
+                    } else {
+                        // Keep reporting an unknown name as HandlerNotFound (with
+                        // the <_movie> wording) — callers use that code to decide
+                        // whether to keep searching; a genuine failure *inside* a
+                        // known handler must keep its own error.
+                        BuiltInHandlerManager::call_handler(handler_name, &args).map_err(|e| {
+                            if e.message.starts_with("No built-in handler:") {
+                                ScriptError::new_code(
+                                    ScriptErrorCode::HandlerNotFound,
+                                    format!("No handler {handler_name} for datum <_movie>"),
+                                )
+                            } else {
+                                e
+                            }
+                        })
+                    }
+                }
+            }
+        }
+        DatumType::StageRef => {
+            // `(the stage).PROP` and `(the stage).PROP[i]` compile to
+            // getProp/getPropRef/getAt on the Stage datum (e.g. the unicraft galaxy's
+            // `(the stage).rect[3] - (the stage).rect[1]`). Without a StageRef arm these
+            // fell to the `_ =>` default → VOID, so stageWidth came out 0 (title baked
+            // off-screen, and the mouse→rotation math divided by zero → endless spin).
+            // Resolve the property via get_stage_prop and index Rect/Point/List results.
+            match handler_name.as_lower_str() {
+                "getprop" | "getat" | "getpropref" if !args.is_empty() => {
+                    reserve_player_mut(|player| {
+                        use crate::director::lingo::datum::Datum;
+                        let prop_name = player.get_datum(&args[0]).symbol_value()?;
+                        let prop_datum = crate::player::stage::get_stage_prop(player, prop_name)?;
+                        if args.len() > 1 {
+                            let index = player.get_datum(&args[1]).int_value()?;
+                            let idx = (index as usize).saturating_sub(1);
+                            match prop_datum {
+                                Datum::Rect(vals, _) => {
+                                    if idx < 4 { Ok(player.alloc_datum(Datum::Int(vals[idx] as i32))) }
+                                    else { Ok(DatumRef::Void) }
+                                }
+                                Datum::Point(vals, _) => {
+                                    if idx < 2 { Ok(player.alloc_datum(Datum::Int(vals[idx] as i32))) }
+                                    else { Ok(DatumRef::Void) }
+                                }
+                                Datum::List(_, items, _) => {
+                                    if idx < items.len() { Ok(items[idx].clone()) } else { Ok(DatumRef::Void) }
+                                }
+                                other => Ok(player.alloc_datum(other)),
+                            }
+                        } else {
+                            Ok(player.alloc_datum(prop_datum))
+                        }
+                    })
+                }
+                _ => {
+                    // Bare property/method access: try get_stage_prop, else VOID.
+                    reserve_player_mut(|player| {
+                        match crate::player::stage::get_stage_prop(player, handler_name) {
+                            Ok(d) => Ok(player.alloc_datum(d)),
+                            Err(_) => Ok(DatumRef::Void),
+                        }
+                    })
+                }
+            }
+        }
+        DatumType::FlashObjectRef => FlashObjectDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::Shockwave3dObjectRef => shockwave3d_object::Shockwave3dObjectDatumHandlers::call(obj_ref, handler_name.as_str(), args),
+        DatumType::Transform3d => transform3d::Transform3dDatumHandlers::call(obj_ref, handler_name, args),
+        DatumType::HavokObjectRef => havok_object::HavokObjectDatumHandlers::call(obj_ref, handler_name.as_str(), args),
+        DatumType::PhysXObjectRef => physx_object::PhysXObjectDatumHandlers::call(obj_ref, handler_name.as_str(), args),
+        DatumType::Void => {
+            // Try VoidDatumHandlers first for specific methods that should return VOID gracefully
+            match VoidDatumHandlers::call(obj_ref.clone(), handler_name, args) {
+                Ok(result) => Ok(result),
+                Err(_) => {
+                    let args_formatted = reserve_player_ref(|player| {
+                        args.iter()
+                            .map(|arg| format_datum(arg, &player))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    });
+                    Err(ScriptError::new_code(
+                        ScriptErrorCode::HandlerNotFound,
+                        format!(
+                            "Cannot call {}({}) on VOID - a variable or property that should contain an object is uninitialized or returned VOID",
+                            handler_name,
+                            args_formatted
+                        ),
+                    ))
+                }
+            }
+        }
+        _ => {
+            // getAt on scalar types (Int, Float) returns the value itself for index 1
+            if handler_name == BuiltInSymbol::GetAt {
+                return Ok(obj_ref.clone());
+            }
+            reserve_player_ref(|player| {
+                let formatted_datum = format_datum(obj_ref, &player);
+                eprintln!(
+                    "Warning: No handler {handler_name} for datum {}, returning VOID",
+                    formatted_datum
+                );
+                Ok(DatumRef::Void)
+            })
+        },
+    };
+
+    if handler_name == BuiltInSymbol::GetPropertyDescriptionList {
+        reserve_player_mut(|player| {
+            player.is_getting_property_descriptions = false;
+        });
+    }
+
+    // Always decrement, even on error
+    reserve_player_mut(|player| {
+        player.handler_stack_depth = player.handler_stack_depth.saturating_sub(1);
+    });
+
+    // end_profiling(profile_token);
+    result
+}

@@ -1,0 +1,7994 @@
+//! WebGL2 GPU-accelerated renderer
+//!
+//! This module provides hardware-accelerated rendering using WebGL2.
+//! It renders sprites as textured quads with shaders implementing
+//! Director's ink modes for pixel-perfect compatibility.
+//!
+//! This is work in progress - the renderer is not yet fully functional.
+
+pub mod context;
+mod geometry;
+pub mod mesh3d;
+pub mod scene3d;
+pub mod xtra_scene;
+mod shaders;
+mod texture_cache;
+
+use log::{debug, warn};
+use itertools::Itertools;
+use wasm_bindgen::{JsCast, JsValue};
+use web_sys::{HtmlCanvasElement, WebGl2RenderingContext};
+
+use std::collections::HashMap;
+
+use crate::player::{
+    DirPlayer, bitmap::{bitmap::{Bitmap, PaletteRef, get_system_default_palette, resolve_color_ref}, drawing::CopyPixelsParams}, cast_lib::CastMemberRef, cast_member::CastMemberType, datum_ref::DatumRef, font::{GlyphPreference, get_glyph_preference, measure_text, measure_text_wrapped}, geometry::IntRect, handlers::datum_handlers::cast_member::font::{FontMemberHandlers, HtmlStyle, StyledSpan, TextAlignment}, score::{ScoreRef, get_concrete_sprite_render_rect as get_concrete_sprite_rect, get_sprite_at}, sprite::{ColorRef, CursorRef, is_skew_flip}, symbols::{builtin::BuiltInSymbol, symbol::Symbol}
+};
+use crate::director::lingo::datum::Datum;
+use crate::js_api::JsApi;
+use crate::rendering::{render_score_to_bitmap_with_offset, FilmLoopParentProps};
+
+pub use context::WebGL2Context;
+pub use geometry::QuadGeometry;
+pub use shaders::{InkMode, ShaderManager};
+pub use texture_cache::{TextureCache, TextureCacheKey, RenderedTextCache, RenderedTextCacheKey};
+const DEBUG_WEBGL2_TEXT: bool = false;
+static SPRITE_DEBUG_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Caret blink phase (500ms on / 500ms off). Mirrors the CPU path's
+/// `caret_blink_visible()` in `rendering.rs` so both renderers blink in sync.
+fn caret_blink_visible_now() -> bool {
+    let t = crate::player::testing_shared::now_ms();
+    (t.rem_euclid(1000.0)) < 500.0
+}
+
+/// Selection-highlight color, matched to the CPU path's `SELECTION_COLOR`.
+const SELECTION_HIGHLIGHT: (u8, u8, u8) = (164, 205, 255);
+
+/// Width of the scrollbar Director draws inside a `#scroll` field's box.
+///
+/// 16px is the classic Mac/Windows scrollbar metric. The Scripting Dictionary
+/// documents `boxType` `#scroll` as adding a scrollbar but never states its
+/// width, so this is INFERRED — corroborated by Summer Resort's "talk.text",
+/// whose score channel width is exactly `authored text width 146 + chrome 6 +
+/// 16`.
+pub const FIELD_SCROLLBAR_WIDTH: i32 = 16;
+
+/// An in-progress score/puppet transition. `old_pixels` is the stage as it
+/// looked before the score change (captured from the preserved drawing buffer,
+/// top-left origin RGBA); `draw_frame` composites it over the freshly-rendered
+/// new stage per elapsed progress until the duration elapses.
+struct TransitionPlayback {
+    old_pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    info: crate::player::cast_member::TransitionInfo,
+    start_ms: i64,
+}
+
+/// WebGL2 hardware-accelerated renderer
+///
+/// This renderer uses WebGL2 to offload compositing to the GPU,
+/// freeing up CPU cycles for script execution.
+#[allow(dead_code)]
+pub struct WebGL2Renderer {
+    /// WebGL2 context wrapper
+    context: WebGL2Context,
+    /// Main canvas element
+    canvas: HtmlCanvasElement,
+    /// Preview canvas element (uses Canvas2D for simplicity)
+    preview_canvas: HtmlCanvasElement,
+    /// Preview 2D context for member preview rendering
+    preview_ctx2d: web_sys::CanvasRenderingContext2d,
+    /// Canvas size
+    size: (u32, u32),
+    /// Preview size
+    preview_size: (u32, u32),
+    /// Shader manager for ink mode shaders
+    shader_manager: ShaderManager,
+    /// Texture cache for bitmap textures
+    texture_cache: TextureCache,
+    /// Quad geometry for sprite rendering
+    quad: QuadGeometry,
+    /// Orthographic projection matrix (column-major for WebGL)
+    projection_matrix: [f32; 16],
+    /// Frame counter for debug logging
+    frame_count: u64,
+    /// Debug: currently selected channel number for inspector
+    pub debug_selected_channel_num: Option<i16>,
+    /// Solid color texture cache (keyed by RGB tuple)
+    solid_color_textures: HashMap<(u8, u8, u8), web_sys::WebGlTexture>,
+    /// Current preview member reference
+    preview_member_ref: Option<CastMemberRef>,
+    /// Preview font size override
+    pub preview_font_size: Option<u16>,
+    /// Preview container element
+    preview_container_element: Option<web_sys::HtmlElement>,
+    /// Rendered text texture cache
+    rendered_text_cache: RenderedTextCache,
+    /// Last known palette version - used to clear texture cache when palettes change
+    last_palette_version: u32,
+    /// Trails framebuffer object for accumulating trails sprite images
+    trails_fbo: Option<web_sys::WebGlFramebuffer>,
+    /// Trails texture (color attachment for trails FBO)
+    trails_texture: Option<web_sys::WebGlTexture>,
+    /// Size of the trails FBO texture
+    trails_size: (u32, u32),
+    /// Reused texture for compositing the script-owned stage framebuffer
+    /// (`(the stage).image` imaging-Lingo overlay). Re-uploaded each frame.
+    stage_image_texture: Option<web_sys::WebGlTexture>,
+    /// Active score/puppet transition being animated over the draw loop.
+    active_transition: Option<TransitionPlayback>,
+    /// Reused texture for compositing the transition frame. Re-uploaded each frame.
+    transition_texture: Option<web_sys::WebGlTexture>,
+    /// GPU copy of the previously-presented frame. The default drawing buffer is
+    /// not reliably preserved for CPU readback between frames, so a transition
+    /// reads its OLD image back from here. Refreshed each frame via copyTexImage2D.
+    prev_frame_texture: Option<web_sys::WebGlTexture>,
+    /// Reusable framebuffer for reading `prev_frame_texture` back to the CPU.
+    prev_frame_fbo: Option<web_sys::WebGlFramebuffer>,
+    /// Shockwave 3D scene renderer
+    scene3d: scene3d::Scene3dRenderer,
+    /// Engine-agnostic external-Xtra 3D scene renderer (scene3d host API — used
+    /// by the Groove plugin and any future 3D xtra)
+    xtra_scenes: xtra_scene::XtraSceneRenderer,
+    native_cursor_cache: crate::cursor::NativeCursorCache,
+    /// Off-screen framebuffer for rendering nested `#movie` sub-players via the
+    /// full WebGL2 pipeline (so they match the host's fidelity instead of the
+    /// lower-quality CPU rasterizer).
+    nested_fbo: Option<web_sys::WebGlFramebuffer>,
+    nested_fbo_texture: Option<web_sys::WebGlTexture>,
+    nested_fbo_size: (u32, u32),
+    /// Per-nested-player caches, swapped in around the sub's off-screen draw so
+    /// the host's texture/text caches (keyed by castLib:member, which collides
+    /// across players) and palette-version tracking are not corrupted or
+    /// thrashed. Keyed by nested player id.
+    nested_caches: HashMap<usize, (TextureCache, RenderedTextCache, u32)>,
+}
+
+impl WebGL2Renderer {
+    /// Create a new WebGL2 renderer
+    pub fn new(
+        canvas: HtmlCanvasElement,
+        preview_canvas: HtmlCanvasElement,
+    ) -> Result<Self, JsValue> {
+        // Force pixel-perfect rendering: prevent browser from bilinear-scaling
+        // the canvas when CSS size or devicePixelRatio differs from canvas dimensions.
+        // Also disable ClearType/subpixel rendering and compositor smoothing.
+        {
+            let style = canvas.style();
+            let _ = style.set_property("image-rendering", "pixelated");
+            let _ = style.set_property("image-rendering", "-moz-crisp-edges");
+            let _ = style.set_property("image-rendering", "crisp-edges");
+            let _ = style.set_property("-webkit-font-smoothing", "none");
+            let _ = style.set_property("-moz-osx-font-smoothing", "grayscale");
+            let _ = style.set_property("font-smooth", "never");
+            let _ = style.set_property("text-rendering", "optimizeSpeed");
+            let _ = style.set_property("backface-visibility", "hidden");
+        }
+
+        // Create WebGL2 context with pixel-perfect settings:
+        // - antialias: false - disable MSAA to prevent sub-pixel blurring
+        // - alpha: true - required for copyTexSubImage2D compatibility with
+        //   RGBA8 trails textures. Stage is cleared to opaque bg each frame.
+        let context_options = js_sys::Object::new();
+        js_sys::Reflect::set(&context_options, &"antialias".into(), &false.into())?;
+        js_sys::Reflect::set(&context_options, &"alpha".into(), &true.into())?;
+
+        let gl = canvas
+            .get_context_with_context_options("webgl2", &context_options)?
+            .ok_or_else(|| JsValue::from_str("WebGL2 not supported"))?
+            .dyn_into::<WebGl2RenderingContext>()?;
+
+        let context = WebGL2Context::new(gl)?;
+        let shader_manager = ShaderManager::new(&context)?;
+        let texture_cache = TextureCache::new();
+        let quad = QuadGeometry::new(&context)?;
+
+        let size = (canvas.width(), canvas.height());
+        let preview_size = (preview_canvas.width(), preview_canvas.height());
+
+        // Create Canvas2D context for preview rendering
+        let preview_ctx2d = preview_canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("Failed to get 2D context for preview"))?
+            .dyn_into::<web_sys::CanvasRenderingContext2d>()?;
+
+        // Create initial orthographic projection matrix
+        let projection_matrix = Self::create_ortho_matrix(size.0 as f32, size.1 as f32);
+
+        Ok(Self {
+            context,
+            canvas,
+            preview_canvas,
+            preview_ctx2d,
+            size,
+            preview_size,
+            shader_manager,
+            texture_cache,
+            quad,
+            projection_matrix,
+            frame_count: 0,
+            debug_selected_channel_num: None,
+            solid_color_textures: HashMap::new(),
+            preview_member_ref: None,
+            preview_font_size: None,
+            preview_container_element: None,
+            rendered_text_cache: RenderedTextCache::new(),
+            last_palette_version: 0,
+            trails_fbo: None,
+            trails_texture: None,
+            trails_size: (0, 0),
+            stage_image_texture: None,
+            active_transition: None,
+            transition_texture: None,
+            prev_frame_texture: None,
+            prev_frame_fbo: None,
+            scene3d: scene3d::Scene3dRenderer::new(),
+            xtra_scenes: xtra_scene::XtraSceneRenderer::new(),
+            native_cursor_cache: None,
+            nested_fbo: None,
+            nested_fbo_texture: None,
+            nested_fbo_size: (0, 0),
+            nested_caches: HashMap::new(),
+        })
+    }
+
+    /// Ensure the nested off-screen FBO exists at `(width, height)` with an RGBA
+    /// color texture attachment. Recreated when the size changes.
+    fn ensure_nested_fbo(&mut self, width: u32, height: u32) {
+        if self.nested_fbo.is_some() && self.nested_fbo_size == (width, height) {
+            return;
+        }
+        let gl = self.context.gl();
+        if let Some(fbo) = self.nested_fbo.take() {
+            gl.delete_framebuffer(Some(&fbo));
+        }
+        if let Some(tex) = self.nested_fbo_texture.take() {
+            gl.delete_texture(Some(&tex));
+        }
+        let texture = gl.create_texture();
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, texture.as_ref());
+        let _ = gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+            WebGl2RenderingContext::TEXTURE_2D,
+            0,
+            WebGl2RenderingContext::RGBA as i32,
+            width as i32,
+            height as i32,
+            0,
+            WebGl2RenderingContext::RGBA,
+            WebGl2RenderingContext::UNSIGNED_BYTE,
+            None,
+        );
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MIN_FILTER, WebGl2RenderingContext::NEAREST as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MAG_FILTER, WebGl2RenderingContext::NEAREST as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_S, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_T, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
+        let fbo = gl.create_framebuffer();
+        gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, fbo.as_ref());
+        gl.framebuffer_texture_2d(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            WebGl2RenderingContext::COLOR_ATTACHMENT0,
+            WebGl2RenderingContext::TEXTURE_2D,
+            texture.as_ref(),
+            0,
+        );
+        gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+        self.nested_fbo = fbo;
+        self.nested_fbo_texture = texture;
+        self.nested_fbo_size = (width, height);
+    }
+
+    /// Render a nested `#movie` sub-player's stage through the full WebGL2
+    /// pipeline into the off-screen FBO, then read it back into a `Bitmap` for
+    /// compositing (same path the CPU rasterizer produced, but at WebGL2
+    /// fidelity). `owner_id` scopes the sub's texture/text caches so they don't
+    /// collide with the host's (both use castLib:member keys).
+    pub fn render_player_to_bitmap(
+        &mut self,
+        player: &mut DirPlayer,
+        owner_id: usize,
+        width: u32,
+        height: u32,
+    ) -> Bitmap {
+        self.ensure_nested_fbo(width, height);
+
+        // Swap in this sub-player's own caches + palette-version tracking so the
+        // shared host state (keyed by castLib:member, which overlaps) is neither
+        // returned in error nor cleared/thrashed by the alternating draws.
+        let (mut sub_tex, mut sub_text, sub_palette) = self
+            .nested_caches
+            .remove(&owner_id)
+            .unwrap_or_else(|| (TextureCache::new(), RenderedTextCache::new(), u32::MAX));
+        std::mem::swap(&mut self.texture_cache, &mut sub_tex);
+        std::mem::swap(&mut self.rendered_text_cache, &mut sub_text);
+        let saved_palette = self.last_palette_version;
+        self.last_palette_version = sub_palette;
+        let saved_size = self.size;
+        let saved_proj = self.projection_matrix;
+
+        // Point the pipeline at the off-screen FBO at the sub's stage size.
+        {
+            let gl = self.context.gl();
+            gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, self.nested_fbo.as_ref());
+            gl.viewport(0, 0, width as i32, height as i32);
+        }
+        self.size = (width, height);
+        self.projection_matrix = Self::create_ortho_matrix(width as f32, height as f32);
+
+        self.draw_frame(player);
+
+        // Read the rendered pixels back (RGBA, bottom-up → flip to top-down).
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        {
+            let gl = self.context.gl();
+            gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, self.nested_fbo.as_ref());
+            let _ = gl.read_pixels_with_opt_u8_array(
+                0, 0, width as i32, height as i32,
+                WebGl2RenderingContext::RGBA, WebGl2RenderingContext::UNSIGNED_BYTE,
+                Some(&mut pixels),
+            );
+        }
+        let row = (width * 4) as usize;
+        let mut flipped = vec![0u8; pixels.len()];
+        for y in 0..height as usize {
+            let src = (height as usize - 1 - y) * row;
+            let dst = y * row;
+            flipped[dst..dst + row].copy_from_slice(&pixels[src..src + row]);
+        }
+
+        // Restore host framebuffer / viewport / projection / caches.
+        {
+            let gl = self.context.gl();
+            gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+            gl.viewport(0, 0, saved_size.0 as i32, saved_size.1 as i32);
+        }
+        self.size = saved_size;
+        self.projection_matrix = saved_proj;
+        let sub_palette = self.last_palette_version;
+        self.last_palette_version = saved_palette;
+        std::mem::swap(&mut self.texture_cache, &mut sub_tex);
+        std::mem::swap(&mut self.rendered_text_cache, &mut sub_text);
+        self.nested_caches.insert(owner_id, (sub_tex, sub_text, sub_palette));
+
+        let mut bitmap = Bitmap::new(
+            width as u16,
+            height as u16,
+            32,
+            32,
+            8,
+            PaletteRef::BuiltIn(get_system_default_palette()),
+        );
+        bitmap.data = flipped;
+        bitmap.use_alpha = true;
+        bitmap
+    }
+
+    /// Create an orthographic projection matrix (column-major for WebGL)
+    /// Maps (0,0)-(width,height) to (-1,-1)-(1,1) with Y flipped for screen coords
+    fn create_ortho_matrix(width: f32, height: f32) -> [f32; 16] {
+        // Ortho projection: x: 0..width -> -1..1, y: 0..height -> 1..-1 (flip Y)
+        let sx = 2.0 / width;
+        let sy = -2.0 / height;  // Negative to flip Y
+        let tx = -1.0;
+        let ty = 1.0;
+
+        // Column-major 4x4 matrix
+        [
+            sx,  0.0, 0.0, 0.0,  // column 0
+            0.0, sy,  0.0, 0.0,  // column 1
+            0.0, 0.0, 1.0, 0.0,  // column 2
+            tx,  ty,  0.0, 1.0,  // column 3
+        ]
+    }
+
+    /// Check if WebGL2 is available
+    pub fn is_supported() -> bool {
+        super::is_webgl2_supported()
+    }
+
+    /// Ensure the trails framebuffer exists and is the correct size.
+    /// The trails FBO accumulates images of trails sprites across frames.
+    fn ensure_trails_fbo(&mut self, width: u32, height: u32) {
+        if self.trails_fbo.is_some() && self.trails_size == (width, height) {
+            return;
+        }
+
+        let gl = self.context.gl();
+
+        // Delete old resources
+        if let Some(fbo) = self.trails_fbo.take() {
+            gl.delete_framebuffer(Some(&fbo));
+        }
+        if let Some(tex) = self.trails_texture.take() {
+            gl.delete_texture(Some(&tex));
+        }
+
+        // Create texture
+        let tex = match gl.create_texture() {
+            Some(t) => t,
+            None => return,
+        };
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&tex));
+        // Use RGBA8 (sized) for the internal format. The default framebuffer
+        // may be RGBA8 or RGB8; copyTexSubImage2D requires a compatible format.
+        // RGBA8 matches the most common default framebuffer configuration.
+        let _ = gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+            WebGl2RenderingContext::TEXTURE_2D,
+            0,
+            WebGl2RenderingContext::RGBA8 as i32,
+            width as i32,
+            height as i32,
+            0,
+            WebGl2RenderingContext::RGBA,
+            WebGl2RenderingContext::UNSIGNED_BYTE,
+            None,
+        );
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MIN_FILTER, WebGl2RenderingContext::NEAREST as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MAG_FILTER, WebGl2RenderingContext::NEAREST as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_S, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_T, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+
+        // Create framebuffer and attach texture
+        let fbo = match gl.create_framebuffer() {
+            Some(f) => f,
+            None => {
+                gl.delete_texture(Some(&tex));
+                return;
+            }
+        };
+        gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(&fbo));
+        gl.framebuffer_texture_2d(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            WebGl2RenderingContext::COLOR_ATTACHMENT0,
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&tex),
+            0,
+        );
+
+        // Clear to transparent
+        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+
+        // Unbind
+        gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+
+        self.trails_fbo = Some(fbo);
+        self.trails_texture = Some(tex);
+        self.trails_size = (width, height);
+    }
+
+    /// Delete the trails FBO and texture.
+    fn destroy_trails_fbo(&mut self) {
+        let gl = self.context.gl();
+        if let Some(fbo) = self.trails_fbo.take() {
+            gl.delete_framebuffer(Some(&fbo));
+        }
+        if let Some(tex) = self.trails_texture.take() {
+            gl.delete_texture(Some(&tex));
+        }
+        self.trails_size = (0, 0);
+    }
+
+    /// Draw the accumulated trails texture as a full-screen quad.
+    fn draw_trails_texture(&mut self) {
+        let trails_tex = match &self.trails_texture {
+            Some(t) => t,
+            None => return,
+        };
+
+        let gl = self.context.gl();
+        let (width, height) = self.size;
+
+        // Use Copy ink for simple blitting
+        let effective_ink = self.shader_manager.use_program(&self.context, InkMode::Copy);
+        let program = match self.shader_manager.get_program(effective_ink) {
+            Some(p) => p,
+            None => return,
+        };
+
+        self.context.set_blend_alpha();
+
+        // Bind trails texture
+        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(trails_tex));
+        if let Some(ref loc) = program.u_texture {
+            gl.uniform1i(Some(loc), 0);
+        }
+
+        // Full-screen quad
+        if let Some(ref loc) = program.u_sprite_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, width as f32, height as f32);
+        }
+        if let Some(ref loc) = program.u_tex_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, 1.0, 1.0);
+        }
+        if let Some(ref loc) = program.u_flip {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        if let Some(ref loc) = program.u_rotation {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_skew_flip {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_floor_rule {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_skew {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_rotation_center {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        if let Some(ref loc) = program.u_blend {
+            gl.uniform1f(Some(loc), 1.0);
+        }
+
+        self.quad.draw(gl);
+
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+    }
+
+    /// Composite the script-owned stage framebuffer (`(the stage).image`) as a
+    /// full-screen quad over the sprite render. No-op until a script has drawn
+    /// into it (`stage_image_dirty`). The bitmap is re-uploaded each frame
+    /// because its contents change as the movie redraws.
+    fn draw_stage_image_overlay(&mut self, player: &mut DirPlayer) {
+        if !player.stage_image_dirty {
+            return;
+        }
+        let stage_ref = match player.stage_image {
+            Some(r) => r,
+            None => return,
+        };
+        let (sw, sh, data) = match player.bitmap_manager.get_bitmap(stage_ref) {
+            Some(b) => (b.width as u32, b.height as u32, b.data.clone()),
+            None => return,
+        };
+        if sw == 0 || sh == 0 {
+            return;
+        }
+
+        // Lazily create the reused texture, then upload the current pixels.
+        if self.stage_image_texture.is_none() {
+            self.stage_image_texture = self.context.create_texture().ok();
+        }
+        let texture = match &self.stage_image_texture {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        if self.context.upload_texture_rgba(&texture, sw, sh, &data).is_err() {
+            return;
+        }
+
+        let (width, height) = self.size;
+        let effective_ink = self.shader_manager.use_program(&self.context, InkMode::Copy);
+        let program = match self.shader_manager.get_program(effective_ink) {
+            Some(p) => p,
+            None => return,
+        };
+        self.context.set_blend_alpha();
+
+        let gl = self.context.gl();
+        self.quad.bind(gl);
+        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
+        if let Some(ref loc) = program.u_texture {
+            gl.uniform1i(Some(loc), 0);
+        }
+        if let Some(ref loc) = program.u_sprite_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, width as f32, height as f32);
+        }
+        if let Some(ref loc) = program.u_tex_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, 1.0, 1.0);
+        }
+        if let Some(ref loc) = program.u_flip {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        if let Some(ref loc) = program.u_rotation {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_skew_flip {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_floor_rule {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_skew {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_rotation_center {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        if let Some(ref loc) = program.u_blend {
+            gl.uniform1f(Some(loc), 1.0);
+        }
+
+        self.quad.draw(gl);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+        self.quad.unbind(gl);
+    }
+
+    /// Read the default framebuffer's RGBA pixels, flipped to a top-left origin
+    /// so the layout matches a `Bitmap` (GL reads bottom-left first).
+    fn read_framebuffer_rgba(&self) -> Vec<u8> {
+        let (width, height) = self.size;
+        let gl = self.context.gl();
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, None);
+        let _ = gl.read_pixels_with_opt_u8_array(
+            0,
+            0,
+            width as i32,
+            height as i32,
+            WebGl2RenderingContext::RGBA,
+            WebGl2RenderingContext::UNSIGNED_BYTE,
+            Some(&mut pixels),
+        );
+        let row = width as usize * 4;
+        let mut flipped = vec![0u8; pixels.len()];
+        for y in 0..height as usize {
+            let src = (height as usize - 1 - y) * row;
+            let dst = y * row;
+            flipped[dst..dst + row].copy_from_slice(&pixels[src..src + row]);
+        }
+        flipped
+    }
+
+    /// Upload a top-left-origin RGBA buffer and draw it full-stage (Copy ink),
+    /// like `draw_stage_image_overlay` but for the transition composite buffer.
+    fn blit_fullscreen_rgba(&mut self, data: &[u8], w: u32, h: u32) {
+        if w == 0 || h == 0 || data.len() != w as usize * h as usize * 4 {
+            return;
+        }
+        if self.transition_texture.is_none() {
+            self.transition_texture = self.context.create_texture().ok();
+        }
+        let texture = match &self.transition_texture {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        if self.context.upload_texture_rgba(&texture, w, h, data).is_err() {
+            return;
+        }
+
+        let (width, height) = self.size;
+        let effective_ink = self.shader_manager.use_program(&self.context, InkMode::Copy);
+        let program = match self.shader_manager.get_program(effective_ink) {
+            Some(p) => p,
+            None => return,
+        };
+        self.context.set_blend_alpha();
+
+        let gl = self.context.gl();
+        self.quad.bind(gl);
+        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
+        if let Some(ref loc) = program.u_texture {
+            gl.uniform1i(Some(loc), 0);
+        }
+        if let Some(ref loc) = program.u_sprite_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, width as f32, height as f32);
+        }
+        if let Some(ref loc) = program.u_tex_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, 1.0, 1.0);
+        }
+        if let Some(ref loc) = program.u_flip {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        if let Some(ref loc) = program.u_rotation {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_skew_flip {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_floor_rule {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_skew {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_rotation_center {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        if let Some(ref loc) = program.u_blend {
+            gl.uniform1f(Some(loc), 1.0);
+        }
+        self.quad.draw(gl);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+        self.quad.unbind(gl);
+    }
+
+    /// Blend the captured OLD stage over the freshly-rendered NEW stage per
+    /// elapsed progress and present the result. On completion it clears the
+    /// transition and releases the player's `score_transition_active` hold so the
+    /// frame loop resumes exactly when the animation ends (precise sync).
+    fn composite_transition(&mut self, player: &mut DirPlayer) {
+        let (info, start_ms, w, h) = match &self.active_transition {
+            Some(t) => (t.info.clone(), t.start_ms, t.width, t.height),
+            None => return,
+        };
+        if (w, h) != self.size {
+            // Stage resized mid-transition: abort cleanly.
+            self.active_transition = None;
+            player.score_transition_active = false;
+            return;
+        }
+        let elapsed = chrono::Utc::now().timestamp_millis() - start_ms;
+        let dur = info.duration_ms.max(1) as i64;
+        let progress = (elapsed as f32 / dur as f32).clamp(0.0, 1.0);
+
+        let mut composited = self.read_framebuffer_rgba();
+        if let Some(t) = &self.active_transition {
+            crate::rendering::composite_transition_pixels(
+                &mut composited,
+                &t.old_pixels,
+                w as i64,
+                h as i64,
+                info.transition_type,
+                info.chunk_size,
+                progress,
+            );
+        }
+        // The stage framebuffer reads back with alpha=0 (opaque RGB, unreliable
+        // alpha). The blit uses alpha blending, so a restored-OLD pixel carrying
+        // alpha=0 would be fully transparent and show the freshly-rendered NEW
+        // frame straight through — making the effect invisible. Force the whole
+        // composite opaque so the blit replaces the stage with old↔new pixels.
+        for px in composited.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        self.blit_fullscreen_rgba(&composited, w, h);
+
+        if progress >= 1.0 {
+            self.active_transition = None;
+            player.score_transition_active = false;
+        }
+    }
+
+    /// Draw the current frame
+    /// True if the sprite in `channel_num` is a Shockwave3D member with
+    /// directToStage enabled. Such sprites are composited directly to the screen
+    /// on top of the 2D layer, so they are deferred past the `(the stage).image`
+    /// overlay in draw_frame to keep the live 3D visible under a HUD blit.
+    fn is_direct_to_stage_3d(&self, player: &DirPlayer, channel_num: i16) -> bool {
+        let sprite = match player.movie.score.get_sprite(channel_num) {
+            Some(s) => s,
+            None => return false,
+        };
+        let member_ref = match &sprite.member {
+            Some(m) => m.clone(),
+            None => return false,
+        };
+        player.movie.cast_manager.find_member_by_ref(&member_ref)
+            .map(|m| matches!(&m.member_type, CastMemberType::Shockwave3d(w3d) if w3d.info.direct_to_stage))
+            .unwrap_or(false)
+    }
+
+    pub fn draw_frame(&mut self, player: &mut DirPlayer) {
+        self.frame_count += 1;
+        // Increment sprite debug frame counter
+        let df = SPRITE_DEBUG_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Sync persistent Transform3d datums → node_transforms for in-place mutations
+        // (e.g. model.transform.position = vector(...) used by overlay/HUD scripts)
+        crate::player::handlers::datum_handlers::shockwave3d_object::sync_persistent_transforms(player);
+        crate::player::handlers::datum_handlers::shockwave3d_object::sync_shader_texture_lists(player);
+
+        // Check if palettes changed and clear texture cache if so
+        // This handles external cast loading where palette members may load after initial render
+        let current_palette_version = player.movie.cast_manager.palette_version();
+        if current_palette_version != self.last_palette_version {
+            self.texture_cache.clear();
+            self.last_palette_version = current_palette_version;
+        }
+
+        // Evict textures for any cast members that were erased or replaced
+        // since the last frame. Cache keys are (castLib, memberNumber, ...), so
+        // if a new member ends up at the same slot number its sprite would
+        // otherwise hit the previous member's texture.
+        for member_ref in player.movie.cast_manager.drain_texture_invalidations() {
+            self.texture_cache.invalidate_for_member(&member_ref);
+            self.rendered_text_cache.invalidate_for_member(&member_ref);
+        }
+
+        // Score/puppet transition: the draw buffer still holds the PREVIOUS
+        // (pre-change) frame (preserveDrawingBuffer is forced on), so snapshot it
+        // as the transition's OLD image before we overwrite it. The composite
+        // pass at the end of draw_frame blends old→new over the effect duration.
+        if self.active_transition.is_none() {
+            if let Some(info) = player.pending_transition.take() {
+                let (w, h) = self.size;
+                let old_pixels = self.read_prev_frame_rgba();
+                if old_pixels.len() == (w as usize * h as usize * 4) {
+                    let start_ms = chrono::Utc::now().timestamp_millis();
+                    self.active_transition = Some(TransitionPlayback {
+                        old_pixels,
+                        width: w,
+                        height: h,
+                        info,
+                        start_ms,
+                    });
+                }
+            }
+        }
+
+        // Clear with stage background color
+        let bg_color = self.get_stage_bg_color(player);
+        {
+            let gl = self.context.gl();
+            gl.clear_color(bg_color.0, bg_color.1, bg_color.2, 1.0);
+            gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+        }
+
+        // Advance texture cache frame counters
+        self.texture_cache.next_frame();
+        self.rendered_text_cache.next_frame();
+
+        // Get sorted channel numbers for current frame
+        let sorted_channels: Vec<(i16, i32)> = player
+            .movie
+            .score
+            .get_sorted_channels(player.movie.current_frame)
+            .iter()
+            .map(|x| (x.number as i16, x.sprite.loc_z))
+            .collect_vec();
+
+        // Check if any sprite has trails
+        let trails_channels: Vec<i16> = sorted_channels.iter()
+            .filter(|(ch, _)| {
+                player.movie.score.get_sprite(*ch).map_or(false, |s| s.trails)
+            })
+            .map(|(ch, _)| *ch)
+            .collect();
+        let has_trails = !trails_channels.is_empty();
+
+        // Bind quad geometry once
+        self.quad.bind(self.context.gl());
+
+        // Draw accumulated trails texture onto the cleared stage
+        if has_trails && self.trails_texture.is_some() {
+            self.draw_trails_texture();
+        }
+
+        // Render each sprite.
+        //
+        // directToStage Shockwave3D sprites are drawn DIRECTLY to the screen, on
+        // top of the 2D layer (Director: directToStage ignores ink/blend and
+        // composites last). When a script has drawn into `(the stage).image`
+        // (`stage_image_dirty`), draw_stage_image_overlay blits that OPAQUE
+        // full-stage bitmap over the sprite output below — which would paste a
+        // frozen snapshot over the live, animating 3D (Splat draws a lives/score
+        // HUD into the stage image, freezing the maze view). Defer such sprites
+        // until after the overlay so the live 3D shows through; the HUD (drawn
+        // into a non-overlapping region) still composites underneath.
+        let overlay_active = player.stage_image_dirty && player.stage_image.is_some();
+        let mut deferred_dts_3d: Vec<i16> = Vec::new();
+        for (channel_num, _) in &sorted_channels {
+            if overlay_active && self.is_direct_to_stage_3d(player, *channel_num) {
+                deferred_dts_3d.push(*channel_num);
+                continue;
+            }
+            self.render_sprite(player, *channel_num);
+        }
+
+        // Accumulate trails sprites into the trails texture via GPU-side copy.
+        // Instead of re-rendering sprites to the FBO, we copy the already-rendered
+        // pixel rects from the default framebuffer using copyTexSubImage2D.
+        if has_trails {
+            let (w, h) = self.size;
+            self.ensure_trails_fbo(w, h);
+
+            if self.trails_texture.is_some() {
+                let gl = self.context.gl();
+
+                // Read from default framebuffer (screen)
+                gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, None);
+
+                // Bind trails texture to copy into
+                let tex = self.trails_texture.as_ref().unwrap();
+                gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(tex));
+
+                // For each trails sprite, copy its bounding rect from screen to trails texture
+                for ch in &trails_channels {
+                    if let Some(sprite) = player.movie.score.get_sprite(*ch) {
+                        let rect = get_concrete_sprite_rect(player, sprite);
+                        let x = rect.left.max(0).min(w as i32);
+                        let y = rect.top.max(0).min(h as i32);
+                        let r = rect.right.max(0).min(w as i32);
+                        let b = rect.bottom.max(0).min(h as i32);
+                        if r > x && b > y {
+                            // WebGL Y is flipped: screen Y=0 is bottom, texture Y=0 is top
+                            let gl_y = h as i32 - b;
+                            let _ = gl.copy_tex_sub_image_2d(
+                                WebGl2RenderingContext::TEXTURE_2D,
+                                0,
+                                x,         // xoffset in texture
+                                gl_y,      // yoffset in texture (flipped)
+                                x,         // x in framebuffer
+                                gl_y,      // y in framebuffer (flipped)
+                                r - x,     // width
+                                b - y,     // height
+                            );
+                        }
+                    }
+                }
+
+                gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+            }
+        } else if self.trails_fbo.is_some() {
+            // No trails sprites - clean up FBO
+            self.destroy_trails_fbo();
+        }
+
+        // Composite the script-owned stage framebuffer over the sprite render
+        // for "imaging Lingo" movies that draw into `(the stage).image`
+        // (see stage.rs `image` getter). Only once a script has drawn into it.
+        self.draw_stage_image_overlay(player);
+
+        // Now draw the deferred directToStage 3D sprites ON TOP of the stage-image
+        // overlay (see the render loop above) so the live, animating 3D is visible
+        // even when a HUD has been blitted into `(the stage).image`.
+        for ch in &deferred_dts_3d {
+            self.render_sprite(player, *ch);
+        }
+
+        // Draw external-Xtra 3D scenes (scene3d host API) onto the stage
+        // (RenderToStage), on top of the 2D layer — like the directToStage 3D
+        // above. The Groove plugin drives these.
+        {
+            let w = player.movie.rect.width() as i32;
+            let h = player.movie.rect.height() as i32;
+            self.xtra_scenes.draw(&self.context, player, w, h);
+            self.shader_manager.clear_active();
+        }
+
+        // Update native CSS cursor (no per-frame draw needed)
+        self.update_native_cursor(player);
+
+        #[cfg(feature = "alloc-debug-overlay")]
+        self.draw_debug_text_overlay(player);
+
+        // Unbind
+        self.quad.unbind(self.context.gl());
+
+        // Draw debug highlight for selected channel
+        if let Some(selected_channel) = self.debug_selected_channel_num {
+            self.draw_debug_highlight(player, selected_channel);
+            // Reset shader manager state since draw_debug_highlight uses its own shader
+            // and calls gl.use_program(None), which desynchronizes the manager's cached state
+            self.shader_manager.clear_active();
+        }
+
+        // Draw pick highlight for hovered sprite
+        if player.picking_mode {
+            let hovered = get_sprite_at(player, player.mouse_loc.0, player.mouse_loc.1, false);
+            if let Some(channel) = hovered {
+                self.draw_pick_highlight(player, channel as i16);
+                self.shader_manager.clear_active();
+            }
+        }
+
+        // Composite an in-progress score/puppet transition: blend the captured
+        // OLD stage over the freshly-rendered NEW stage per elapsed progress and
+        // present it. Releases the player's playhead hold on completion.
+        if self.active_transition.is_some() {
+            self.composite_transition(player);
+            self.shader_manager.clear_active();
+        }
+
+        // Force the canvas alpha channel to 1.0 everywhere before present.
+        // The WebGL2 context uses `alpha: true` (needed for copyTexSubImage2D
+        // trails compatibility), which means per-pixel framebuffer alpha
+        // controls how the canvas composites with the page. Blend-mode sprites
+        // (e.g. ink 39 "Darkest" with sprite.blend=25 like cc.mixer.shadow)
+        // end up with alpha ≈ blend% in the framebuffer, and any non-dark
+        // element behind the canvas bleeds through, making the shadow render
+        // whitish. Clear only the alpha channel with colorMask so RGB stays
+        // untouched. The stage-bg clear at frame start already wrote alpha=1.0,
+        // but sprite draws then blended it down; this restores it.
+        {
+            let gl = self.context.gl();
+            gl.color_mask(false, false, false, true);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+            gl.color_mask(true, true, true, true);
+        }
+
+        // Snapshot the just-presented frame into a GPU texture so a transition
+        // beginning next frame can read it back as its OLD image. Skip while a
+        // nested `#movie` sub-player is rendering into the host framebuffer.
+        if unsafe { crate::player::ACTIVE_PLAYER_ID } == 0 {
+            self.copy_framebuffer_to_prev();
+        }
+    }
+
+    /// Copy the current default framebuffer into `prev_frame_texture` (GPU-side,
+    /// no CPU stall). Allocates/resizes the texture as needed.
+    fn copy_framebuffer_to_prev(&mut self) {
+        let (w, h) = self.size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self.prev_frame_texture.is_none() {
+            self.prev_frame_texture = self.context.gl().create_texture();
+        }
+        let tex = match &self.prev_frame_texture {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let gl = self.context.gl();
+        gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, None);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&tex));
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MIN_FILTER, WebGl2RenderingContext::NEAREST as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MAG_FILTER, WebGl2RenderingContext::NEAREST as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_S, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
+        gl.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_T, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
+        gl.copy_tex_image_2d(
+            WebGl2RenderingContext::TEXTURE_2D,
+            0,
+            WebGl2RenderingContext::RGBA,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            0,
+        );
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+    }
+
+    /// Read `prev_frame_texture` back to the CPU as top-left-origin RGBA (the
+    /// captured OLD frame for a starting transition).
+    fn read_prev_frame_rgba(&mut self) -> Vec<u8> {
+        let (w, h) = self.size;
+        let tex = match &self.prev_frame_texture {
+            Some(t) => t.clone(),
+            None => return vec![0u8; w as usize * h as usize * 4],
+        };
+        if self.prev_frame_fbo.is_none() {
+            self.prev_frame_fbo = self.context.gl().create_framebuffer();
+        }
+        let fbo = self.prev_frame_fbo.clone();
+        let gl = self.context.gl();
+        gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, fbo.as_ref());
+        gl.framebuffer_texture_2d(
+            WebGl2RenderingContext::READ_FRAMEBUFFER,
+            WebGl2RenderingContext::COLOR_ATTACHMENT0,
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&tex),
+            0,
+        );
+        let mut pixels = vec![0u8; w as usize * h as usize * 4];
+        let _ = gl.read_pixels_with_opt_u8_array(
+            0,
+            0,
+            w as i32,
+            h as i32,
+            WebGl2RenderingContext::RGBA,
+            WebGl2RenderingContext::UNSIGNED_BYTE,
+            Some(&mut pixels),
+        );
+        gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, None);
+        // Copied from the bottom-left-origin framebuffer; flip to top-left.
+        let row = w as usize * 4;
+        let mut flipped = vec![0u8; pixels.len()];
+        for y in 0..h as usize {
+            let src = (h as usize - 1 - y) * row;
+            let dst = y * row;
+            flipped[dst..dst + row].copy_from_slice(&pixels[src..src + row]);
+        }
+        flipped
+    }
+
+    pub fn capture_stage_bitmap(&mut self, player: &mut DirPlayer) -> Bitmap {
+        // A nested `#movie` sub-player reads `(the stage).image` while running
+        // in the HOST GL context: framebuffer = host canvas, `self.size` = the
+        // host stage (e.g. 1190x575). Drawing `draw_frame(sub)` here would
+        // render the sub's sprites at host size onto the host framebuffer —
+        // the sub's wide scrolling background and its off-screen (x>stage-width)
+        // sprites smear across the whole host stage, unclipped. Render through
+        // the off-screen FBO at the sub's own stage size instead (same headless
+        // path as render_nested_player_stages).
+        let active = unsafe { crate::player::ACTIVE_PLAYER_ID };
+        if active != 0 {
+            let w = player.movie.rect.width().max(1) as u32;
+            let h = player.movie.rect.height().max(1) as u32;
+            let mut bmp = self.render_player_to_bitmap(player, active, w, h);
+            bmp.use_alpha = true;
+            return bmp;
+        }
+
+        self.draw_frame(player);
+
+        let (width, height) = self.size;
+        let gl = self.context.gl();
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, None);
+        let _ = gl.read_pixels_with_opt_u8_array(
+            0,
+            0,
+            width as i32,
+            height as i32,
+            WebGl2RenderingContext::RGBA,
+            WebGl2RenderingContext::UNSIGNED_BYTE,
+            Some(&mut pixels),
+        );
+
+        let row_size = (width * 4) as usize;
+        let mut flipped = vec![0u8; pixels.len()];
+        for y in 0..height as usize {
+            let src_row = (height as usize - 1 - y) * row_size;
+            let dst_row = y * row_size;
+            flipped[dst_row..dst_row + row_size]
+                .copy_from_slice(&pixels[src_row..src_row + row_size]);
+        }
+
+        let mut bitmap = Bitmap::new(
+            width as u16,
+            height as u16,
+            32,
+            32,
+            8,
+            PaletteRef::BuiltIn(get_system_default_palette()),
+        );
+        bitmap.data = flipped;
+        bitmap.use_alpha = true;
+        bitmap
+    }
+
+    fn update_native_cursor(&mut self, player: &mut DirPlayer) {
+        crate::cursor::update_native_cursor(player, &self.canvas, &mut self.native_cursor_cache);
+    }
+
+    /// Get stage background color as normalized floats
+    fn get_stage_bg_color(&self, player: &DirPlayer) -> (f32, f32, f32) {
+        let palettes = player.movie.cast_manager.palettes();
+        let (r, g, b) = resolve_color_ref(
+            &palettes,
+            &player.bg_color,
+            &PaletteRef::BuiltIn(get_system_default_palette()),
+            8, // bit depth
+        );
+        (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+    }
+
+    /// Draw debug text overlay showing datum and script counts
+    fn draw_debug_text_overlay(&mut self, player: &mut DirPlayer) {
+        // Get system font
+        let font = match player.font_manager.get_system_font() {
+            Some(f) => f,
+            None => return, // No font available
+        };
+
+        // Get font bitmap
+        let font_bitmap = match player.bitmap_manager.get_bitmap(font.bitmap_ref) {
+            Some(b) => b,
+            None => return, // No font bitmap
+        };
+
+        // Create debug text
+        let txt = format!(
+            "Datum count: {}\nScript count: {}",
+            player.allocator.datum_count(),
+            player.allocator.script_instance_count()
+        );
+
+        // Measure text to determine texture size
+        let (text_width, text_height) = measure_text(&txt, &font, None, 0, 0, 0);
+        let width = (text_width as u32).max(1);
+        let height = (text_height as u32).max(1);
+
+        // Create a 32-bit RGBA bitmap for rendering text
+        let mut text_bitmap = Bitmap::new(
+            width as u16,
+            height as u16,
+            32,
+            32,
+            0,
+            PaletteRef::BuiltIn(get_system_default_palette()),
+        );
+
+        // Bitmap::new initializes 32-bit data to 255 (white/opaque)
+        // We'll make white pixels transparent after rendering text
+
+        let palettes = player.movie.cast_manager.palettes();
+
+        // Set up copy parameters for text rendering with background transparent ink
+        let params = CopyPixelsParams { mask_offset: (0, 0),
+            blend: 100,
+            ink: 36, // Background transparent
+            color: ColorRef::Rgb(0, 0, 0), // Black text
+            bg_color: ColorRef::Rgb(255, 255, 255), // White background (transparent)
+            mask_image: None,
+            is_text_rendering: true,
+            rotation: 0.0,
+            skew: 0.0,
+            sprite: None,
+            original_dst_rect: None,
+            bg_color_explicit: false,
+            fore_color_explicit: false,
+            ink9_mask_bitmap: None, ink9_mask_offset: (0, 0),
+            floor_rule: false,
+        };
+
+        // Render text to the bitmap
+        text_bitmap.draw_text(
+            &txt,
+            &font,
+            font_bitmap,
+            0,
+            0,
+            params,
+            &palettes,
+            0,
+            0,
+        );
+
+        // After drawing text, convert white pixels to transparent
+        for i in 0..text_bitmap.data.len() / 4 {
+            let r = text_bitmap.data[i * 4];
+            let g = text_bitmap.data[i * 4 + 1];
+            let b = text_bitmap.data[i * 4 + 2];
+            if r == 255 && g == 255 && b == 255 {
+                text_bitmap.data[i * 4 + 3] = 0;
+            }
+        }
+
+        // Upload the bitmap as a texture
+        let texture = match self.context.create_texture() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if self.context.upload_texture_rgba(&texture, width, height, &text_bitmap.data).is_err() {
+            return;
+        }
+
+        // Draw the debug text texture at top-left corner
+        let ink_mode = InkMode::Copy;
+        let effective_ink = self.shader_manager.use_program(&self.context, ink_mode);
+
+        let program = match self.shader_manager.get_program(effective_ink) {
+            Some(p) => p,
+            None => return,
+        };
+
+        self.context.set_blend_alpha();
+
+        let gl = self.context.gl();
+
+        // Set projection matrix
+        if let Some(ref loc) = program.u_projection {
+            gl.uniform_matrix4fv_with_f32_array(Some(loc), false, &self.projection_matrix);
+        }
+
+        // Bind texture
+        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
+        if let Some(ref loc) = program.u_texture {
+            gl.uniform1i(Some(loc), 0);
+        }
+
+        // Set sprite rect uniform (position at 0,0 with text dimensions)
+        if let Some(ref loc) = program.u_sprite_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, width as f32, height as f32);
+        }
+
+        // Set texture rect (full texture)
+        if let Some(ref loc) = program.u_tex_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, 1.0, 1.0);
+        }
+
+        // No flip
+        if let Some(ref loc) = program.u_flip {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+
+        // No rotation
+        if let Some(ref loc) = program.u_rotation {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_rotation_center {
+            gl.uniform2f(Some(loc), 0.0, 0.0);
+        }
+        // No skew flip
+        if let Some(ref loc) = program.u_skew_flip {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_floor_rule {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+        if let Some(ref loc) = program.u_skew {
+            gl.uniform1f(Some(loc), 0.0);
+        }
+
+        // Full blend
+        if let Some(ref loc) = program.u_blend {
+            gl.uniform1f(Some(loc), 1.0);
+        }
+
+        // Draw the quad
+        self.quad.draw(gl);
+
+        // Cleanup
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+        gl.delete_texture(Some(&texture));
+    }
+
+    /// Draw debug highlight rectangle around selected sprite
+    fn draw_debug_highlight(&self, player: &DirPlayer, channel_num: i16) {
+        let sprite = match player.movie.score.get_sprite(channel_num) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let rect = get_concrete_sprite_rect(player, sprite);
+        let gl = self.context.gl();
+
+        // Draw red border using WebGL lines
+        // Convert to normalized device coordinates
+        let width = self.size.0 as f32;
+        let height = self.size.1 as f32;
+
+        let left = (rect.left as f32 / width) * 2.0 - 1.0;
+        let right = (rect.right as f32 / width) * 2.0 - 1.0;
+        let top = 1.0 - (rect.top as f32 / height) * 2.0;
+        let bottom = 1.0 - (rect.bottom as f32 / height) * 2.0;
+
+        // Create line vertices for a rectangle
+        let vertices: [f32; 16] = [
+            left, top,      // top-left
+            right, top,     // top-right
+            right, top,     // top-right
+            right, bottom,  // bottom-right
+            right, bottom,  // bottom-right
+            left, bottom,   // bottom-left
+            left, bottom,   // bottom-left
+            left, top,      // back to top-left
+        ];
+
+        // Create a VAO to isolate our state changes
+        let vao = gl.create_vertex_array().unwrap();
+        gl.bind_vertex_array(Some(&vao));
+
+        // Create a simple line shader program if we don't have one
+        // For now, use a direct WebGL approach
+        let buffer = gl.create_buffer().unwrap();
+        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&buffer));
+
+        unsafe {
+            let vert_array = js_sys::Float32Array::view(&vertices);
+            gl.buffer_data_with_array_buffer_view(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                &vert_array,
+                WebGl2RenderingContext::STATIC_DRAW,
+            );
+        }
+
+        // Use a simple shader for colored lines
+        let vs_source = "
+            attribute vec2 a_position;
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+            }
+        ";
+        let fs_source = "
+            precision mediump float;
+            uniform vec4 u_color;
+            void main() {
+                gl_FragColor = u_color;
+            }
+        ";
+
+        let vs = gl.create_shader(WebGl2RenderingContext::VERTEX_SHADER).unwrap();
+        gl.shader_source(&vs, vs_source);
+        gl.compile_shader(&vs);
+
+        let fs = gl.create_shader(WebGl2RenderingContext::FRAGMENT_SHADER).unwrap();
+        gl.shader_source(&fs, fs_source);
+        gl.compile_shader(&fs);
+
+        let program = gl.create_program().unwrap();
+        gl.attach_shader(&program, &vs);
+        gl.attach_shader(&program, &fs);
+        gl.link_program(&program);
+        gl.use_program(Some(&program));
+
+        let pos_loc = gl.get_attrib_location(&program, "a_position") as u32;
+        gl.enable_vertex_attrib_array(pos_loc);
+        gl.vertex_attrib_pointer_with_i32(pos_loc, 2, WebGl2RenderingContext::FLOAT, false, 0, 0);
+
+        let color_loc = gl.get_uniform_location(&program, "u_color");
+        gl.uniform4f(color_loc.as_ref(), 1.0, 0.0, 0.0, 1.0); // Red color
+
+        gl.draw_arrays(WebGl2RenderingContext::LINES, 0, 8);
+
+        // Draw a green pixel at the sprite's loc point
+        let loc_x = (sprite.loc_h as f32 / width) * 2.0 - 1.0;
+        let loc_y = 1.0 - (sprite.loc_v as f32 / height) * 2.0;
+
+        let point_vertices: [f32; 2] = [loc_x, loc_y];
+        unsafe {
+            let vert_array = js_sys::Float32Array::view(&point_vertices);
+            gl.buffer_data_with_array_buffer_view(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                &vert_array,
+                WebGl2RenderingContext::STATIC_DRAW,
+            );
+        }
+
+        gl.uniform4f(color_loc.as_ref(), 0.0, 1.0, 0.0, 1.0); // Green color
+        gl.draw_arrays(WebGl2RenderingContext::POINTS, 0, 1);
+
+        // Cleanup - unbind and delete everything to restore state
+        gl.bind_vertex_array(None);
+        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, None);
+        gl.use_program(None);
+
+        gl.delete_vertex_array(Some(&vao));
+        gl.delete_buffer(Some(&buffer));
+        gl.delete_program(Some(&program));
+        gl.delete_shader(Some(&vs));
+        gl.delete_shader(Some(&fs));
+    }
+
+    /// Draw a green highlight rectangle around the hovered sprite during picking mode.
+    fn draw_pick_highlight(&self, player: &DirPlayer, channel_num: i16) {
+        let sprite = match player.movie.score.get_sprite(channel_num) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let rect = get_concrete_sprite_rect(player, sprite);
+        let gl = self.context.gl();
+
+        let width = self.size.0 as f32;
+        let height = self.size.1 as f32;
+
+        let left = (rect.left as f32 / width) * 2.0 - 1.0;
+        let right = (rect.right as f32 / width) * 2.0 - 1.0;
+        let top = 1.0 - (rect.top as f32 / height) * 2.0;
+        let bottom = 1.0 - (rect.bottom as f32 / height) * 2.0;
+
+        let vertices: [f32; 16] = [
+            left, top,
+            right, top,
+            right, top,
+            right, bottom,
+            right, bottom,
+            left, bottom,
+            left, bottom,
+            left, top,
+        ];
+
+        let vao = gl.create_vertex_array().unwrap();
+        gl.bind_vertex_array(Some(&vao));
+
+        let buffer = gl.create_buffer().unwrap();
+        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&buffer));
+
+        unsafe {
+            let vert_array = js_sys::Float32Array::view(&vertices);
+            gl.buffer_data_with_array_buffer_view(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                &vert_array,
+                WebGl2RenderingContext::STATIC_DRAW,
+            );
+        }
+
+        let vs_source = "
+            attribute vec2 a_position;
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+            }
+        ";
+        let fs_source = "
+            precision mediump float;
+            uniform vec4 u_color;
+            void main() {
+                gl_FragColor = u_color;
+            }
+        ";
+
+        let vs = gl.create_shader(WebGl2RenderingContext::VERTEX_SHADER).unwrap();
+        gl.shader_source(&vs, vs_source);
+        gl.compile_shader(&vs);
+
+        let fs = gl.create_shader(WebGl2RenderingContext::FRAGMENT_SHADER).unwrap();
+        gl.shader_source(&fs, fs_source);
+        gl.compile_shader(&fs);
+
+        let program = gl.create_program().unwrap();
+        gl.attach_shader(&program, &vs);
+        gl.attach_shader(&program, &fs);
+        gl.link_program(&program);
+        gl.use_program(Some(&program));
+
+        let pos_loc = gl.get_attrib_location(&program, "a_position") as u32;
+        gl.enable_vertex_attrib_array(pos_loc);
+        gl.vertex_attrib_pointer_with_i32(pos_loc, 2, WebGl2RenderingContext::FLOAT, false, 0, 0);
+
+        let color_loc = gl.get_uniform_location(&program, "u_color");
+        gl.uniform4f(color_loc.as_ref(), 0.0, 1.0, 0.0, 1.0); // Green color
+
+        gl.draw_arrays(WebGl2RenderingContext::LINES, 0, 8);
+
+        gl.bind_vertex_array(None);
+        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, None);
+        gl.use_program(None);
+
+        gl.delete_vertex_array(Some(&vao));
+        gl.delete_buffer(Some(&buffer));
+        gl.delete_program(Some(&program));
+        gl.delete_shader(Some(&vs));
+        gl.delete_shader(Some(&fs));
+    }
+
+    /// Render a single sprite
+    fn render_sprite(&mut self, player: &mut DirPlayer, channel_num: i16) {
+        // Get sprite and member info
+        let (member_ref, mut sprite_rect, ink, mut blend, flip_h, flip_v, rotation, skew, bg_color, fg_color, has_fore_color, has_back_color, is_puppet, raw_loc, sprite_width, sprite_height, w3d_camera, w3d_extra_cams) = {
+            let score = &player.movie.score;
+            let sprite = match score.get_sprite(channel_num) {
+                Some(s) => s,
+                None => return,
+            };
+
+            let member_ref = match &sprite.member {
+                Some(m) => m.clone(),
+                None => return,
+            };
+
+            let rect = get_concrete_sprite_rect(player, sprite);
+
+            // Cull off-screen sprites HERE, before the per-sprite clones below.
+            // Sprite-pool movies park every free sprite off-stage — Merlin's
+            // Revenge 3 holds a 999-sprite pool whose `freeSprite` puts each one
+            // at (-1, -1) at 1x1 — so in the common case this returns for ~1000
+            // channels a frame and the clones would be pure waste. (The same
+            // test ran a few lines further down before, after the clones.)
+            {
+                let (stage_w, stage_h) = self.size;
+                if rect.right <= 0
+                    || rect.bottom <= 0
+                    || rect.left >= stage_w as i32
+                    || rect.top >= stage_h as i32
+                {
+                    return;
+                }
+            }
+
+            let w3d_cam = sprite.w3d_camera.clone();
+            let w3d_extra_cams = sprite.w3d_cameras.clone();
+            if w3d_cam.is_some() || !w3d_extra_cams.is_empty() {
+                debug!(
+                    "[W3D-RENDER] sprite {} camera={:?} extras={:?}",
+                    channel_num, w3d_cam, w3d_extra_cams
+                );
+            }
+            // A GIF carries the background colour the file declares, and a
+            // movie hides it with ink 36, which keys out the background
+            // colour. The score's bgColor for such a sprite is whatever the
+            // author left there, usually white, so a GIF with any other
+            // background drew as a solid box.
+            let bg_color = if crate::player::gif::is_gif_member(player, member_ref.cast_lib, member_ref.cast_member) {
+                player.movie.cast_manager.find_member_by_ref(&member_ref)
+                    .map(|m| m.bg_color.clone())
+                    .unwrap_or_else(|| sprite.bg_color.clone())
+            } else {
+                sprite.bg_color.clone()
+            };
+            (
+                member_ref,
+                rect,
+                sprite.ink,
+                sprite.effective_blend(),
+                sprite.flip_h,
+                sprite.flip_v,
+                sprite.rotation,
+                sprite.skew,
+                sprite.bg_color.clone(),
+                sprite.color.clone(),
+                sprite.has_fore_color,
+                sprite.has_back_color,
+                sprite.puppet,
+                (sprite.loc_h, sprite.loc_v),
+                sprite.width,
+                sprite.height,
+                w3d_cam,
+                w3d_extra_cams,
+            )
+        };
+
+        // (Off-screen culling now happens above, before the per-sprite clones.)
+
+        // Sprite-level `blend` on Flash members is ignored by Shockwave
+        // regardless of directToStage — Director's D8-era Flash sprite
+        // compositor doesn't apply the sprite blend value (verified
+        // against the storyscramble tile sprite: score had blend=50,
+        // Director rendered at full opacity, directToStage=false).
+        // Force blend=100 for any Flash member so we match Shockwave;
+        // without this the tile sprite shows up washed-out / gray.
+        if let Some(member) = player.movie.cast_manager.find_member_by_ref(&member_ref) {
+            if matches!(member.member_type, CastMemberType::Flash(_)) {
+                blend = 100;
+            } else if matches!(member.member_type, CastMemberType::Shockwave3d(_)) && blend == 0 {
+                // A Shockwave3D member's sprite-level `blend` comes through as 0 when the
+                // score's D6+ "blend enabled" flag (sprite_flags & 0x10) is set over a
+                // junk-default raw byte (255 → convert_raw_blend → 0). blend=0 (fully
+                // transparent) is never intended for the main composited 3D view —
+                // Director renders these opaque (the FinalDrive / HavokCarDemo car movies
+                // came through black). Treat 0 as opaque so the scene shows. Mirrors the
+                // Flash force above (Shockwave's 2D compositor ignores sprite blend on
+                // these special composited members).
+                blend = 100;
+            }
+        }
+
+        // Determine what kind of texture we need based on member type
+        enum TextureSource {
+            /// `is_flash` distinguishes a captureFrame bitmap from Ruffle
+            /// (true) from a plain authored Director bitmap (false). Flash
+            /// bitmaps have their transparency already encoded in the alpha
+            /// channel via wmode='transparent', so ink modes that color-key
+            /// against sprite.bg_color must NOT also strip matching pixels
+            /// (that erases SWF artwork whose fill happens to equal the
+            /// sprite's bg). Plain bitmaps with use_alpha=true (e.g. PNGs
+            /// imported as 32-bit) still need the color-key path for ink 36
+            /// to actually do its "background transparent" job — Habbo v1's
+            /// 32-bit init bitmap with ink 36 + bg palette-index-0 relies
+            /// on it to strip black corners.
+            Bitmap { image_ref: u32, is_flash: bool },
+            SolidColor { r: u8, g: u8, b: u8 },
+            RenderedText {
+                cache_key: RenderedTextCacheKey,
+                text: String,
+                font_name: String,
+                font_size: u16,
+                font_style: Option<u8>,
+                font_id: Option<u16>,
+                line_spacing: u16,
+                top_spacing: i16,
+                /// The member's authored top_spacing (leading), BEFORE the
+                /// scroll fold-in that produces `top_spacing` above. Director
+                /// adds top_spacing as inter-line leading, NOT before the first
+                /// line, so the PFR anchor subtracts this to land the first
+                /// baseline at the strike ascent while keeping scroll
+                /// (`top_spacing - member_top_spacing == -scroll_top`).
+                member_top_spacing: i16,
+                bottom_spacing: i16,
+                width: u32,
+                height: u32,
+                /// Width to use for word-wrap calculations. May be smaller
+                /// than `width` when the field's text-wrap width
+                /// (`field.width`) is narrower than the sprite display
+                /// rect (`sprite.width`). Defaults to `width` for non-
+                /// field text where the two are the same.
+                wrap_width: u32,
+                text_fg_color: ColorRef,
+                text_bg_color: ColorRef,
+                styled_spans: Option<Vec<StyledSpan>>,
+                alignment: BuiltInSymbol,
+                word_wrap: bool,
+                border: u16,
+                box_drop_shadow: u16,
+                /// Scrollbar geometry for a #scroll field, with the `scrollTop`
+                /// the lift should sit at. `None` for every other member.
+                scrollbar: Option<(crate::player::score::FieldScrollbar, i32)>,
+                tab_stops: Vec<crate::player::cast_member::TabStop>,
+                /// Per-text-line line_spacing override from XMED par_runs.
+                /// One entry per text-line (split by \r/\n). Empty when
+                /// the member has no per-paragraph spacing data.
+                per_line_spacings: Vec<u16>,
+                /// Per-text-line par_info index parallel to
+                /// `per_line_spacings`. Used to detect source-paragraph
+                /// transitions in the styled rendering paths and apply
+                /// `\sa` + `\sb` boundary spacing once between paragraphs.
+                per_line_par_idx: Vec<u16>,
+                /// XMED par_info table (paragraph-formatting records).
+                /// Used by the native renderer to apply `\sa`/`\sb`
+                /// boundary spacing at paragraph transitions. Empty when
+                /// the member has no per-paragraph data.
+                par_infos: Vec<crate::director::chunks::xmedia_styled_text::ParInfo>,
+                /// XMED par_run table mapping text positions to par_info
+                /// indices. Co-empty with `par_infos`.
+                par_runs: Vec<crate::director::chunks::xmedia_styled_text::ParRun>,
+                /// Member-level `the charSpacing of member`. Applied as
+                /// extra horizontal pixels between glyphs in the bitmap
+                /// rendering path. Negative values tighten (FurniFactory
+                /// displayComputer uses -2). Already factored into
+                /// `measure_text_wrapped`.
+                char_spacing: i32,
+            },
+            FilmLoop {
+                initial_rect: IntRect,
+                width: u32,
+                height: u32,
+            },
+            ButtonBitmap {
+                width: u32,
+                height: u32,
+                button_type: crate::player::cast_member::ButtonType,
+                hilite: bool,
+                text: String,
+                font_name: String,
+                font_size: u16,
+                font_id: Option<u16>,
+                alignment: BuiltInSymbol,
+                ink: i32,
+            },
+            ShapeBitmap {
+                width: u32,
+                height: u32,
+                shape_info: crate::director::enums::ShapeInfo,
+                fg_color: (u8, u8, u8),
+                bg_color: (u8, u8, u8),
+                // Pre-resolved 256-colour palette table for tile patterns
+                // (shape pattern 57-64). Some only when the shape uses a tile;
+                // tile pixels are palette indices resolved through this table
+                // (the movie's frame palette). See builtin_tiles.
+                tile_palette: Option<Vec<(u8, u8, u8)>>,
+                // VWTL user-defined tile: source bitmap + region to tile + the
+                // sprite's absolute stage origin (to phase the tile to the stage
+                // grid, so the checker's blue/white cells aren't swapped). Takes
+                // precedence over the built-in tile/pattern when present.
+                custom_tile: Option<(Bitmap, crate::player::geometry::IntRect, (i32, i32))>,
+            },
+            VectorShapeBitmap {
+                width: u32,
+                height: u32,
+                vector_member: crate::player::cast_member::VectorShapeMember,
+            },
+            Shockwave3dScene {
+                width: u32,
+                height: u32,
+                /// One entry per camera in the sprite's camera list, in draw order
+                /// (lowest index first). Each carries the member whose world that
+                /// camera belongs to, so a sprite can composite cameras from several
+                /// members — Director's model, and what AreaZero's menu needs to draw
+                /// its skybox, 3D scene and orthographic UI layer into one sprite.
+                passes: Vec<Shockwave3dPass>,
+            },
+        }
+
+        struct Shockwave3dPass {
+            member_key: (i32, i32),
+            scene: std::rc::Rc<crate::director::chunks::w3d::types::W3dScene>,
+            runtime_state: crate::player::cast_member::Shockwave3dRuntimeState,
+            /// `None` = let the renderer pick its default view.
+            camera: Option<Symbol>,
+        }
+
+        // Set by filmloop logic: true when the stage sprite dimensions match the
+        // filmloop's sprite-dim rect, meaning the score dimensions are intentional.
+        let mut filmloop_sprite_dims_match = false;
+
+        // Handle Flash member dispatch before the texture_source borrow block.
+        // We dispatch per (sprite, cast_lib, cast_member) so multiple sprites
+        // sharing one Flash cast member each get their own Ruffle player
+        // instance — required so e.g. storyscramble's 3 story tiles can pin
+        // to different poster frames of the same SWF simultaneously.
+        {
+            let dispatch_key = (channel_num, member_ref.cast_lib, member_ref.cast_member);
+            // Only the HOST dispatches Flash from the render path. A nested
+            // `#movie` sub-player's Flash lifecycle is owned SOLELY by its own
+            // `pre_dispatch_flash_members` (load + unload + reconcile, all in the
+            // sub's frame loop). Letting this render-path (which runs in the HOST
+            // loop during `render_nested_player_stages -> draw_frame(sub)`) also
+            // dispatch created TWO sources reading the sub's score at different
+            // playhead moments — they raced over flash_sprite_loaded and the
+            // Ruffle instance was create/destroy-thrashed, so its capture loop
+            // died before pushing a frame (sub Flash never showed).
+            let is_host = unsafe { crate::player::ACTIVE_PLAYER_ID } == 0;
+            if is_host && !player.flash_sprite_loaded.contains(&dispatch_key) {
+                if let Some(member) = player.movie.cast_manager.find_member_by_ref(&member_ref) {
+                    if let CastMemberType::Flash(flash_member) = &member.member_type {
+                        debug!(
+                            "Flash dispatch check sprite#{} {}:{} data_len={} first_bytes={:?}",
+                            channel_num, member_ref.cast_lib, member_ref.cast_member,
+                            flash_member.data.len(),
+                            &flash_member.data[..3.min(flash_member.data.len())]
+                        );
+                        if crate::rendering::has_swf_signature(&flash_member.data) {
+                            let data = flash_member.data.clone();
+                            // Size the Ruffle capture from the resolved sprite rect
+                            // (which is the member's natural size when the sprite
+                            // isn't stretched — 626x100 for leo3d's "menue"), NOT
+                            // the raw score cell (100x320). Using the cell captured
+                            // the 626x100 SWF into a wrong-aspect canvas that
+                            // resampled to a thin strip in the corrected quad.
+                            let w = sprite_rect.width().max(1) as u32;
+                            let h = sprite_rect.height().max(1) as u32;
+                            let paused_at_start = flash_member
+                                .flash_info
+                                .as_ref()
+                                .map(|fi| fi.paused_at_start)
+                                .unwrap_or(false);
+                            let asserted_frame = player
+                                .movie
+                                .score
+                                .get_sprite(channel_num)
+                                .and_then(|s| s.flash_asserted_frame)
+                                .unwrap_or(-1);
+                            JsApi::dispatch_flash_member_loaded(
+                                channel_num as i32,
+                                member_ref.cast_lib,
+                                member_ref.cast_member,
+                                &data,
+                                w,
+                                h,
+                                paused_at_start,
+                                asserted_frame,
+                            );
+                            player.flash_sprite_loaded.insert(dispatch_key);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve 1x1 placeholder textures in W3D scenes from cast member bitmaps.
+        // IFX stores 1x1 white placeholders for textures that should be loaded from cast members.
+        {
+            // Step 1: Collect placeholder names (immutable borrow of scene)
+            let placeholder_names: Vec<Symbol> = {
+                let member = player.movie.cast_manager.find_member_by_ref(&member_ref);
+                member.and_then(|m| m.member_type.as_shockwave3d())
+                    .and_then(|w3d| w3d.parsed_scene.as_ref())
+                    .map(|scene| {
+                        scene.texture_images.iter()
+                            .filter(|(_, data)| data.len() == 12 && data[..8] == [1,0,0,0, 1,0,0,0])
+                            .map(|(name, _)| name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            // Step 2: Resolve each placeholder from cast member bitmaps
+            if !placeholder_names.is_empty() {
+                static PH_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                let ph_log = !PH_LOG.swap(true, std::sync::atomic::Ordering::Relaxed);
+                if ph_log {
+                    debug!(
+                        "[W3D-PH] {} placeholders to resolve", placeholder_names.len()
+                    );
+                }
+                let mut resolved: Vec<(Symbol, Vec<u8>)> = Vec::new();
+                let palettes = player.movie.cast_manager.palettes();
+                for tex_name in &placeholder_names {
+                    let tex_name_str = tex_name.to_string();
+                    let found_ref = player.movie.cast_manager.find_member_ref_by_name(&tex_name_str);
+                    if ph_log && tex_name.as_str().contains("panel") {
+                        let status = match &found_ref {
+                            Some(r) => {
+                                let m = player.movie.cast_manager.find_member_by_ref(r);
+                                match m {
+                                    Some(m) => {
+                                        let bmp_size = match &m.member_type {
+                                            CastMemberType::Bitmap(bm) => {
+                                                player.bitmap_manager.get_bitmap(bm.image_ref)
+                                                    .map(|b| format!("{}x{}", b.width, b.height))
+                                                    .unwrap_or("no_bmp".into())
+                                            }
+                                            _ => format!("type={}", m.member_type.type_string()),
+                                        };
+                                        format!("found {}:{} '{}' {}", r.cast_lib, r.cast_member, m.name, bmp_size)
+                                    }
+                                    None => "ref_but_no_member".into(),
+                                }
+                            }
+                            None => "NOT_FOUND".into(),
+                        };
+                        debug!("[W3D-PH] '{}' -> {}", tex_name, status);
+                    }
+                    if let Some(src_ref) = found_ref {
+                        if let Some(src_member) = player.movie.cast_manager.find_member_by_ref(&src_ref) {
+                            if let CastMemberType::Bitmap(bmp_member) = &src_member.member_type {
+                                if let Some(bmp) = player.bitmap_manager.get_bitmap(bmp_member.image_ref) {
+                                    if bmp.width > 1 || bmp.height > 1 {
+                                        let w = bmp.width;
+                                        let h = bmp.height;
+                                        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+                                        for y in 0..h as usize {
+                                            for x in 0..w as usize {
+                                                let (r, g, b, a) = bmp.get_pixel_color_with_alpha(&palettes, x as u16, y as u16);
+                                                let idx = (y * w as usize + x) * 4;
+                                                rgba[idx] = r;
+                                                rgba[idx + 1] = g;
+                                                rgba[idx + 2] = b;
+                                                rgba[idx + 3] = a;
+                                            }
+                                        }
+                                        let mut tex_data = Vec::with_capacity(8 + rgba.len());
+                                        tex_data.extend_from_slice(&(w as u32).to_le_bytes());
+                                        tex_data.extend_from_slice(&(h as u32).to_le_bytes());
+                                        tex_data.extend_from_slice(&rgba);
+                                        resolved.push((tex_name.clone(), tex_data));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Step 3: Insert resolved textures into scene (mutable borrow)
+                if !resolved.is_empty() {
+                    if let Some(member) = player.movie.cast_manager.find_mut_member_by_ref(&member_ref) {
+                        if let Some(w3d) = member.member_type.as_shockwave3d_mut() {
+                            if let Some(scene) = w3d.scene_mut() {
+                                for (name, data) in resolved {
+                                    scene.texture_images.insert(name, data);
+                                    scene.texture_content_version += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-advance: when a non-looping motion ends, play next queued motion
+        if self.scene3d.motion_ended {
+            if let Some(member) = player.movie.cast_manager.find_mut_member_by_ref(&member_ref) {
+                if let Some(w3d) = member.member_type.as_shockwave3d_mut() {
+                    if !w3d.runtime_state.motion_queue.is_empty() {
+                        let next = w3d.runtime_state.motion_queue.remove(0);
+                        w3d.runtime_state.current_motion = Some(next.name);
+                        w3d.runtime_state.animation_loop = next.looped;
+                        w3d.runtime_state.animation_start_time = next.start_time;
+                        w3d.runtime_state.animation_end_time = next.end_time;
+                        w3d.runtime_state.animation_scale = next.scale;
+                        w3d.runtime_state.animation_time = if next.offset >= 0.0 { next.offset } else { 0.0 };
+                        w3d.runtime_state.animation_playing = true;
+                        w3d.runtime_state.motion_ended = false;
+                        self.scene3d.motion_ended = false;
+                    }
+                }
+            }
+        }
+
+        // Auto-start animation for Shockwave3D members with animationEnabled
+        // This triggers when the sprite first appears on stage during playback.
+        if let Some(member) = player.movie.cast_manager.find_mut_member_by_ref(&member_ref) {
+            if let Some(w3d) = member.member_type.as_shockwave3d_mut() {
+                if w3d.info.animation_enabled {
+                    let first_motion = w3d.parsed_scene.as_ref()
+                        .and_then(|s| s.motions.first()).map(|m| m.name.clone());
+                    let loops = w3d.info.loops;
+                    if let Some(motion_name) = first_motion {
+                        // Per-MODEL auto-play: seed the first motion into EACH skinned
+                        // model's own bonesPlayer entry. The dino animates only via
+                        // auto-play (its behavior never calls play()/rootLock), so its
+                        // pause()/resume() buttons must act on the SAME per-model state
+                        // the renderer reads — otherwise they hit a bare stub whose sync
+                        // clobbered the legacy clock (pause restarted, play froze).
+                        let skinned: Vec<String> = w3d.parsed_scene.as_ref().map(|s| {
+                            s.nodes.iter()
+                                .filter(|n| n.node_type == crate::director::chunks::w3d::types::W3dNodeType::Model)
+                                .filter(|n| {
+                                    let key = if !n.model_resource_name.as_str().is_empty() {
+                                        n.model_resource_name
+                                    } else { n.resource_name };
+                                    s.skeletons.iter().any(|sk| sk.name == key && sk.bones.len() > 1)
+                                })
+                                .map(|n| n.name.to_string())
+                                .collect()
+                        }).unwrap_or_default();
+                        let any_skinned = !skinned.is_empty();
+                        for model in &skinned {
+                            let bp = w3d.runtime_state.bones_player_mut(Symbol::from_str(model));
+                            if bp.current_motion.is_none() && !bp.animation_playing {
+                                bp.current_motion = Some(Symbol::from_str(&motion_name.clone().to_string()));
+                                bp.animation_playing = true;
+                                bp.animation_loop = loops;
+                            }
+                        }
+                        // Legacy member-level auto-play for non-skinned (keyframe) content.
+                        if !any_skinned
+                            && !w3d.runtime_state.animation_playing
+                            && w3d.runtime_state.current_motion.is_none()
+                        {
+                            w3d.runtime_state.current_motion = Some(motion_name);
+                            w3d.runtime_state.animation_playing = true;
+                            w3d.runtime_state.animation_loop = loops;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Note: persistent Transform3d datum → node_transforms sync is handled by
+        // set_node_transform() when properties are set. We do NOT sync here because
+        // worldPosition/pointAt update node_transforms directly, and overwriting from
+        // a stale persistent datum would undo those updates.
+
+        let texture_source = {
+            let member = match player.movie.cast_manager.find_member_by_ref(&member_ref) {
+                Some(m) => m,
+                None => return,
+            };
+
+            match &member.member_type {
+                CastMemberType::Bitmap(bitmap_member) => {
+                    TextureSource::Bitmap { image_ref: bitmap_member.image_ref, is_flash: false }
+                }
+                CastMemberType::Shape(shape_member) => {
+                    // Skip blank placeholders and zero-size shapes, but NOT a
+                    // #line: a line is 1 px in one dimension by nature, so
+                    // "width <= 1 || height <= 1" dropped every horizontal and
+                    // vertical line before the Line arm below ever ran. The
+                    // divider under the ruler on klods.dcr's working drawing
+                    // went missing this way (S8, measured against the
+                    // projector). A line is skipped only when BOTH collapse.
+                    let is_line = matches!(shape_member.shape_info.shape_type, crate::director::enums::ShapeType::Line);
+                    if (sprite_width <= 1 || sprite_height <= 1) && !(is_line && (sprite_width > 1 || sprite_height > 1)) {
+                        return;
+                    }
+
+                    // Skip rendering shapes that use member 1:1 (placeholder) —
+                    // D5+ only. Director 4 uses member 1 as a real shape (e.g.
+                    // thead's pattern-filled background); dropping it leaves the
+                    // stage colour showing through. See the CPU path in rendering.rs.
+                    if player.movie.dir_version >= 500
+                        && member_ref.cast_lib == 1 && member_ref.cast_member == 1 {
+                        return;
+                    }
+
+                    let palettes = player.movie.cast_manager.palettes();
+                    let frame_palette = player.movie.score.get_frame_palette(player.movie.current_frame);
+                    let fg_rgb = resolve_color_ref(
+                        &palettes,
+                        &fg_color,
+                        &frame_palette,
+                        8,
+                    );
+                    let bg_rgb = resolve_color_ref(
+                        &palettes,
+                        &bg_color,
+                        &frame_palette,
+                        8,
+                    );
+
+                    // Tile patterns (57-64) need a per-index palette table,
+                    // resolved through the frame palette (so tile index 247
+                    // becomes the same red as the foreColor, etc.).
+                    let tile_palette = if crate::player::bitmap::builtin_tiles::tile_for_pattern(
+                        shape_member.shape_info.pattern,
+                    )
+                    .is_some()
+                    {
+                        Some(crate::player::bitmap::bitmap::resolve_palette_table(
+                            &palettes,
+                            &frame_palette,
+                            8,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    // VWTL custom tile (pattern 57-64 with a defined bitmap
+                    // member): resolve the source bitmap + region to tile.
+                    let custom_tile = {
+                        let pat = shape_member.shape_info.pattern;
+                        if pat >= 57 && pat <= 64 {
+                            player.movie.score.custom_tiles
+                                .get((pat - 57) as usize)
+                                .filter(|t| t.is_custom())
+                                .and_then(|t| {
+                                    let tref = CastMemberRef { cast_lib: t.cast_lib, cast_member: t.member };
+                                    player.movie.cast_manager.find_member_by_ref(&tref)
+                                        .and_then(|m| match &m.member_type {
+                                            CastMemberType::Bitmap(b) => Some(b.image_ref),
+                                            _ => None,
+                                        })
+                                        .and_then(|ir| player.bitmap_manager.get_bitmap(ir).cloned())
+                                        .map(|src| (src, crate::player::geometry::IntRect::from(
+                                            t.left as i32, t.top as i32, t.right as i32, t.bottom as i32),
+                                            (sprite_rect.left, sprite_rect.top)))
+                                })
+                        } else { None }
+                    };
+
+                    TextureSource::ShapeBitmap {
+                        width: sprite_width as u32,
+                        height: sprite_height as u32,
+                        shape_info: shape_member.shape_info.clone(),
+                        fg_color: fg_rgb,
+                        bg_color: bg_rgb,
+                        tile_palette,
+                        custom_tile,
+                    }
+                }
+                CastMemberType::VectorShape(vector_member) => {
+                    if sprite_width <= 1 || sprite_height <= 1 {
+                        return;
+                    }
+                    // D5+ only — see the Shape branch above.
+                    if player.movie.dir_version >= 500
+                        && member_ref.cast_lib == 1 && member_ref.cast_member == 1 {
+                        return;
+                    }
+                    TextureSource::VectorShapeBitmap {
+                        width: sprite_width as u32,
+                        height: sprite_height as u32,
+                        vector_member: vector_member.clone(),
+                    }
+                }
+                CastMemberType::Font(font_member) => {
+                    // Font member: render preview_text using the font
+                    let text = &font_member.preview_text;
+                    if text.is_empty() {
+                        return; // No text to render
+                    }
+
+                    // Use sprite rect dimensions for the texture (not measured text)
+                    // This prevents stretching when sprite rect differs from text size
+                    let width = (sprite_rect.width()).max(1) as u32;
+                    let height = (sprite_rect.height()).max(1) as u32;
+
+                    // Get styled spans reference for cache key
+                    let styled_spans_ref = if font_member.preview_html_spans.is_empty() {
+                        None
+                    } else {
+                        Some(font_member.preview_html_spans.as_slice())
+                    };
+
+                    let mut cache_key = RenderedTextCacheKey::new_with_styled_spans(
+                        member_ref.clone(),
+                        text,
+                        styled_spans_ref,
+                        ink,
+                        blend,
+                        fg_color.clone(),
+                        bg_color.clone(),
+                        false,
+                        0,
+                        0,
+                        false,
+                        width,
+                        height,
+                        BuiltInSymbol::Left,  // Font members default to left alignment
+                        false,   // Font members default to no word wrap
+                        &font_member.font_info.name,
+                        font_member.font_info.size,
+                        Some(font_member.font_info.style),
+                        font_member.fixed_line_space,
+                        font_member.top_spacing,
+                    );
+                    let transform_active =
+                        skew.abs() > 0.001 || rotation.abs() > 0.1;
+                    cache_key.keep_authored_height = transform_active;
+                    cache_key.transform_active = transform_active;
+
+                    TextureSource::RenderedText {
+                        cache_key,
+                        text: text.clone(),
+                        font_name: font_member.font_info.name.clone(),
+                        font_size: font_member.font_info.size,
+                        font_style: Some(font_member.font_info.style),
+                        font_id: Some(font_member.font_info.font_id),
+                        line_spacing: font_member.fixed_line_space,
+                        top_spacing: font_member.top_spacing,
+                        member_top_spacing: font_member.top_spacing,
+                        bottom_spacing: 0,
+                        width,
+                        height,
+                        wrap_width: width,
+                        text_fg_color: fg_color.clone(),
+                        text_bg_color: bg_color.clone(),
+                        styled_spans: if font_member.preview_html_spans.is_empty() {
+                            None
+                        } else {
+                            Some(font_member.preview_html_spans.clone())
+                        },
+                        alignment: BuiltInSymbol::Left,
+                        word_wrap: false,
+                        border: 0,
+                        box_drop_shadow: 0,
+                        scrollbar: None,
+                        tab_stops: Vec::new(),
+                        per_line_spacings: Vec::new(),
+                        per_line_par_idx: Vec::new(),
+                        par_infos: Vec::new(),
+                        par_runs: Vec::new(),
+                        char_spacing: 0,
+                    }
+                }
+                CastMemberType::Text(text_member) => {
+                    // Text member: render the text using specified font
+                    let text = &text_member.text;
+                    if text.is_empty() {
+                        return; // No text to render
+                    }
+
+                    // Derive wrapping behavior from text member box type + explicit wordWrap flag.
+                    // Director commonly uses #adjust with wrapped multi-line text.
+                    let box_type_key = text_member
+                        .box_type;
+                    let box_type_implies_wrap = box_type_key == BuiltInSymbol::Adjust;
+                    let effective_word_wrap = text_member.word_wrap || box_type_implies_wrap;
+                    let long_wrapped_text = effective_word_wrap && text.len() > 80;
+
+                    // Keep mixed source sizing behavior stable to avoid regressions in small labels/buttons.
+                    let width = if long_wrapped_text {
+                        sprite_rect.width().max(1) as u32
+                    } else if text_member.width > 0 {
+                        (text_member.width as i32).max(sprite_rect.width()).max(1) as u32
+                    } else {
+                        sprite_rect.width().max(1) as u32
+                    };
+                    // Rasterize text at MEMBER-authored line bounds (lines ×
+                    // member.height) rather than `sprite_rect.height`. Director
+                    // stores the per-line authored height in `member.height`;
+                    // when a #fixed sprite stretches the member to a taller
+                    // box (CS / FurniFactory clock display: member 52×18
+                    // puppeted onto a 52×48 sprite), Director rasterizes the
+                    // glyphs at the small natural size and lets the texture
+                    // stretch into the larger sprite quad. Using
+                    // sprite_rect.height instead drew small glyphs at the
+                    // top of the parallelogram with the rest empty.
+                    let _line_count = text
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .split('\n')
+                        .count()
+                        .max(1) as i32;
+                    // For long wrapped HTML text the per-line × _line_count
+                    // formula doesn't fit (single-paragraph members have
+                    // `_line_count=1`), so we use a different source.
+                    //   - When the text has EXPLICIT line breaks AND
+                    //     `text_member.height` is set, the stored value is
+                    //     the laid-out total (Paige `doc_bottom` from
+                    //     XMED dword90, set in cast_member.rs creation).
+                    //     CS Junkbot credits (member 171): 375 matches
+                    //     Director, while sprite_rect.height inflates
+                    //     to 414 from a stale score frame.
+                    //   - For wrap-only members (member 82 recycler help,
+                    //     1 paragraph, 0 \n) the stored value is too small
+                    //     (~85 single-line authored), so we fall back to
+                    //     sprite_rect.height — which matches the dynamic
+                    //     measurement Director performs there (~108).
+                    let has_explicit_breaks = text.contains('\n') || text.contains('\r');
+                    // Texture render-area height priority:
+                    //  1. Puppet text members: use sprite_rect.height
+                    //     (score.rs already grew it to fit measured
+                    //     wrapped content). The stored
+                    //     `text_member.height` is parse-time authored
+                    //     and stale once a script assigns runtime text.
+                    //  2. #adjust boxType: also use sprite_rect.height.
+                    //     score.rs's `get_concrete_sprite_rect` handles
+                    //     the Junkbot-credits-vs-Buggy-info trade-off
+                    //     (70% rule: stored if close to measured, else
+                    //     grow to measured). Trusting sprite_rect here
+                    //     keeps the texture in sync with the sprite box
+                    //     so all visible content renders.
+                    //  3. Other boxTypes (#fixed, #scroll, #limit) keep
+                    //     the historical "lines × text_member.height"
+                    //     behavior — these are user-resizable boxes
+                    //     where overflow is meant to be clipped.
+                    let is_adjust = text_member.box_type == BuiltInSymbol::Adjust;
+                    let base_height = if is_puppet || is_adjust {
+                        sprite_rect.height().max(1)
+                    } else if long_wrapped_text {
+                        sprite_rect.height().max(1)
+                    } else if text_member.height > 0 {
+                        // `text_member.height` resolves to the full
+                        // member.rect.height (cast_member.rs uses Paige's
+                        // page_h / info_h, NOT per-line stride). For the
+                        // FurniFactory displayComputer (member 7,
+                        // "Time\r59.31"): info_h=48, page_h=36,
+                        // per_line=18 → text_member.height=36, the full
+                        // 2-line box. Use it directly as the texture
+                        // target height. Multiplying by line_count
+                        // (legacy code, when member.height was per-line)
+                        // produced 72 — a 2× squish into the 36-px quad.
+                        // Safety net: if member.height looks like a per-
+                        // line stride (≈ fixed_line_space and < line_count
+                        // strides), fall back to line_count × stride.
+                        let mh = text_member.height as i32;
+                        let fls = text_member.fixed_line_space as i32;
+                        let strides = fls.max(1) * _line_count;
+                        if fls > 0 && mh > 0 && mh + 2 < strides {
+                            strides
+                        } else {
+                            mh.max(1)
+                        }
+                    } else {
+                        sprite_rect.height().max(1)
+                    };
+                    // Allocate the bitmap generously for any text
+                    // length. Visual line count = source line count
+                    // (\r-separated paragraphs) plus an estimate of
+                    // wrap-induced extra lines (rough: text length /
+                    // chars-per-line). Per-line stride is the larger
+                    // of the authored max line_spacing and the label
+                    // auto-fallback (font_size * 5/4). The actual
+                    // rendered y is reported back via
+                    // `content_height_actual` and used to trim the
+                    // texture upload to the true content size.
+                    let spacing_pad = (text_member.top_spacing as i32)
+                        .saturating_add(text_member.bottom_spacing as i32)
+                        .max(0);
+                    let max_authored_ls = text_member
+                        .par_infos
+                        .iter()
+                        .map(|pi| pi.line_spacing)
+                        .max()
+                        .unwrap_or(0) as i32;
+                    let auto_fallback_stride = (text_member.font_size as i32) * 5 / 4;
+                    let max_stride = max_authored_ls.max(auto_fallback_stride);
+                    let source_line_count = (text.matches('\r').count()
+                        + text.matches('\n').count()
+                        - text.matches("\r\n").count()
+                        + 1) as i32;
+                    // Estimate wrap-induced extra lines from text
+                    // length and approximate chars-per-visual-line.
+                    let chars_per_line = (width as i32
+                        / ((text_member.font_size as i32) / 2).max(1))
+                        .max(1);
+                    let wrap_estimate = (text.chars().count() as i32 / chars_per_line).max(0);
+                    let visual_line_estimate = source_line_count + wrap_estimate + 2;
+                    let content_estimate = max_stride * visual_line_estimate + spacing_pad;
+                    // For #adjust text without explicit \r/\n breaks, score.rs
+                    // already grew sprite_rect.height to fit the laid-out
+                    // content (its 70% rule covers wrapped single paragraphs
+                    // too). Allocating the bigger `content_estimate` here
+                    // produces a taller bitmap than the sprite quad — the
+                    // NATIVE renderer doesn't track `content_height_actual`,
+                    // so the over-allocated rows reach the GPU and the
+                    // texture gets vertically compressed when stretched into
+                    // the smaller sprite quad. Symptom: short bold labels
+                    // ("Hahmosi nimi", "Salasana:" at 9pt) render as a tiny
+                    // ~44% gray strip across the top of the field. For these
+                    // members `base_height` (= sprite_rect.height) is the
+                    // correct budget. Keep the generous budget for explicit-
+                    // break and non-#adjust text where wrap-overflow is
+                    // possible and the PFR-bitmap renderer will trim via
+                    // content_height_actual.
+                    // Sprites with skew/rotation render at the authored
+                    // member box (`keep_authored_height` is set on the
+                    // cache_key below from the same condition). The
+                    // generous `content_estimate` would over-allocate the
+                    // texture to wrap-worst-case (e.g. FurniFactory
+                    // displayComputer member 7: base_height=36, but
+                    // content_estimate=90 = 18 stride × 5 visual lines)
+                    // and `upload_height = render_height` keeps it at 90,
+                    // which squishes 2.5× into the 36-px quad.
+                    let has_transform_for_height =
+                        skew.abs() > 0.001 || rotation.abs() > 0.1;
+                    // #fixed / #scroll / #limit box types are CLIPPED to the
+                    // sprite rect by Director — they never grow. Never pick
+                    // `content_estimate` (which adds a +2 wrap buffer ×
+                    // max_stride) over `base_height` for these, otherwise a
+                    // 14-px field box gets allocated ~33 rows for a single
+                    // Verdana-9 line, and the texture stretches/spills past
+                    // the sprite quad into adjacent UI (spineworld_dcr
+                    // registration form: txt_password's render covered the
+                    // "Again:" label one row down once content was present).
+                    // `content_estimate` stays in play only for the
+                    // `else`-of-else cases (explicit-break #adjust members,
+                    // non-transform #fixed members with multi-line text where
+                    // the authored height was too tight for what's now there).
+                    let is_fixed_like = matches!(
+                        text_member.box_type.as_str(),
+                        "fixed" | "#fixed" | "scroll" | "#scroll" | "limit" | "#limit"
+                    );
+                    let height = if is_adjust && !has_explicit_breaks {
+                        base_height.max(1) as u32
+                    } else if has_transform_for_height {
+                        base_height.max(1) as u32
+                    } else if is_fixed_like {
+                        base_height.max(1) as u32
+                    } else {
+                        (base_height.max(content_estimate)).max(1) as u32
+                    };
+                    let _ = has_explicit_breaks;
+
+                    // Extract font properties from first styled span if available
+                    let (font_name, font_size, font_style) = if !text_member.html_styled_spans.is_empty() {
+                        let first_style = &text_member.html_styled_spans[0].style;
+                        // Always prefer text_member.font (may have been changed at runtime via Lingo)
+                        // Only fall back to styled span font_face when member font is empty
+                        let name = if !text_member.font.is_empty() {
+                            text_member.font.clone()
+                        } else {
+                            first_style.font_face.clone().unwrap_or_else(|| "Arial".to_string())
+                        };
+                        // Prefer runtime font_size (set by Lingo) over original XMED span size.
+                        // The XMED span retains the authoring-time value; the runtime value takes priority.
+                        let size = if text_member.font_size > 0 {
+                            text_member.font_size
+                        } else {
+                            first_style.font_size.map(|s| s as u16).unwrap_or(12)
+                        };
+                        // Convert bold/italic/underline to font_style: bit 0 = bold, bit 1 = italic, bit 2 = underline
+                        let style = (if first_style.bold { 1u8 } else { 0 })
+                            | (if first_style.italic { 2u8 } else { 0 })
+                            | (if first_style.underline { 4u8 } else { 0 });
+                        (name, size, Some(style))
+                    } else {
+                        let mut style = 0u8;
+                        if text_member.font_style.iter().any(|s| *s == BuiltInSymbol::Bold) {
+                            style |= 1;
+                        }
+                        if text_member.font_style.iter().any(|s| *s == BuiltInSymbol::Italic) {
+                            style |= 2;
+                        }
+                        if text_member.font_style.iter().any(|s| *s == BuiltInSymbol::Underline) {
+                            style |= 4;
+                        }
+                        (
+                            text_member.font.clone(),
+                            text_member.font_size,
+                            if style == 0 { None } else { Some(style) },
+                        )
+                    };
+                    // Color priority for text:
+                    // 1. Non-default RGB sprite.color wins outright. Catches both
+                    //    score-frame-data tweens (FurniFactory animates sprite.color
+                    //    to Rgb(214,183,58) via the score; has_fore_color stays false
+                    //    because the flag only catches Lingo writes) AND explicit
+                    //    Lingo `sprite.color = rgb(...)` writes. Black is excluded
+                    //    so a sprite at its RGB default doesn't shadow member.color.
+                    // 2. Non-black RGB CastMember `.color`. Coke Studios does
+                    //    `sprite.color = paletteIndex(255)` (default-marker) +
+                    //    `member.color = rgb(...)`; member RGB wins over the
+                    //    sprite's palette default.
+                    //
+                    //    Black is excluded for the same reason it is in rule 1:
+                    //    an RGB black is the member's DEFAULT, not an authored
+                    //    choice, and letting it match shadows a sprite colour
+                    //    that really was authored. dkbarrel draws its Help Text
+                    //    twice from ONE member (47, storing RGB black) as a drop
+                    //    shadow — sprite 975 carries palette index 4 (yellow),
+                    //    sprite 974 palette index 255 (black). With black
+                    //    excluded here, both fall through to the sprite colour
+                    //    and each copy keeps its own.
+                    // 3. Sprite has_fore_color (Lingo touched it, palette index).
+                    // 4. Non-default, non-black sprite.color (score palette index).
+                    // 5. Single styled-span color (XMED/HTML).
+                    // 6. Stored member.color (palette fallback).
+                    // 7. sprite.color as final fallback.
+                    let text_fg_color = if matches!(fg_color, ColorRef::Rgb(..))
+                        && fg_color != ColorRef::Rgb(0, 0, 0)
+                    {
+                        fg_color.clone()
+                    } else if matches!(member.color, ColorRef::Rgb(..))
+                        && member.color != ColorRef::Rgb(0, 0, 0)
+                    {
+                        member.color.clone()
+                    } else if has_fore_color {
+                        fg_color.clone()
+                    } else if fg_color != ColorRef::PaletteIndex(255) && fg_color != ColorRef::Rgb(0, 0, 0) {
+                        fg_color.clone()
+                    } else if text_member.html_styled_spans.len() == 1 {
+                        let style_color = text_member.html_styled_spans[0].style.color;
+                        if let Some(c) = style_color {
+                            ColorRef::Rgb(
+                                ((c >> 16) & 0xFF) as u8,
+                                ((c >> 8) & 0xFF) as u8,
+                                (c & 0xFF) as u8,
+                            )
+                        } else if member.color != ColorRef::PaletteIndex(255) {
+                            member.color.clone()
+                        } else {
+                            fg_color.clone()
+                        }
+                    } else if member.color != ColorRef::PaletteIndex(255) {
+                        member.color.clone()
+                    } else {
+                        fg_color.clone()
+                    };
+                    // Resolve PaletteIndex to RGB so span color assignment gets real colors
+                    let text_fg_color = match &text_fg_color {
+                        ColorRef::PaletteIndex(_) => {
+                            let palettes = player.movie.cast_manager.palettes();
+                            let (r, g, b) = resolve_color_ref(
+                                &palettes,
+                                &text_fg_color,
+                                &PaletteRef::BuiltIn(get_system_default_palette()),
+                                8,
+                            );
+                            ColorRef::Rgb(r, g, b)
+                        }
+                        _ => text_fg_color,
+                    };
+                    // Priority: sprite bgColor (if explicitly set) > member bgColor > sprite bgColor (default)
+                    let effective_bg = if has_back_color {
+                        bg_color.clone()
+                    } else {
+                        match &member.bg_color {
+                            ColorRef::Rgb(_, _, _) => member.bg_color.clone(),
+                            _ => bg_color.clone(),
+                        }
+                    };
+                    let text_bg_color = match &effective_bg {
+                        ColorRef::PaletteIndex(_) => {
+                            let palettes = player.movie.cast_manager.palettes();
+                            let (r, g, b) = resolve_color_ref(
+                                &palettes,
+                                &effective_bg,
+                                &PaletteRef::BuiltIn(get_system_default_palette()),
+                                8,
+                            );
+                            ColorRef::Rgb(r, g, b)
+                        }
+                        _ => effective_bg,
+                    };
+
+                    // Log color decision for text members
+                    {
+                        let span_colors: Vec<String> = text_member.html_styled_spans.iter().enumerate().map(|(i, s)| {
+                            let c = s.style.color.map(|c| format!("#{:06X}", c & 0xFFFFFF)).unwrap_or_else(|| "none".to_string());
+                            format!("span[{}]={}", i, c)
+                        }).collect();
+                        debug!(
+                            "TextMember color decision: member='{}' has_fore_color={} sprite.color={:?} -> text_fg={:?} spans=[{}]",
+                            member.name, has_fore_color, fg_color, text_fg_color, span_colors.join(", ")
+                        );
+                    }
+
+                    // Use the FIRST span's size (the document default) as
+                    // the baseline for runtime_size_scale, NOT max(span sizes).
+                    // For multi-span members like CS Junkbot credits where
+                    // some spans intentionally use larger sizes (headings at
+                    // size=23, body at size=12), max would yield 23 and
+                    // scaling everything by `member.font_size/max = 12/23
+                    // ≈ 0.52` would shrink ALL spans — including the body
+                    // text — to half size. The first span is the document
+                    // default; if the member's font_size differs from THAT,
+                    // it indicates Lingo resized the member at runtime.
+                    let initial_span_size = text_member
+                        .html_styled_spans
+                        .iter()
+                        .find_map(|s| s.style.font_size.filter(|sz| *sz > 0))
+                        .unwrap_or(0);
+                    let runtime_size_scale = if text_member.font_size > 0
+                        && initial_span_size > 0
+                        && (text_member.font_size as i32) != initial_span_size
+                    {
+                        Some(text_member.font_size as f32 / initial_span_size as f32)
+                    } else {
+                        None
+                    };
+
+                    // Fill in defaults from text_member and apply runtime overrides when needed.
+                    // Preserve span colors from XMED styles. Member foreColor is only fallback.
+
+                    let styled_spans_with_defaults: Option<Vec<StyledSpan>> = if text_member.html_styled_spans.is_empty() {
+                        None
+                    } else {
+                        Some(text_member.html_styled_spans.iter().map(|span| {
+                            let mut style = span.style.clone();
+
+                            // ALWAYS use text_member's font if set (movie may have changed it)
+                            if !text_member.font.is_empty() {
+                                style.font_face = Some(text_member.font.clone());
+                            } else if style.font_face.as_ref().map_or(true, |f| f.is_empty()) {
+                                style.font_face = Some("Arial".to_string());
+                            }
+
+                            // Preserve per-span sizes from styled text, but allow runtime
+                            // text_member.font_size to scale the whole style run set.
+                            if let Some(scale) = runtime_size_scale {
+                                if let Some(span_size) = style.font_size.filter(|s| *s > 0) {
+                                    style.font_size = Some(((span_size as f32 * scale).round() as i32).max(1));
+                                } else {
+                                    style.font_size = Some(text_member.font_size as i32);
+                                }
+                            } else if style.font_size.map_or(true, |s| s <= 0) {
+                                style.font_size = Some(12);
+                            }
+
+                            // Override span colors when:
+                            // - sprite has explicit foreColor from tween/Lingo (has_fore_color)
+                            // - sprite has non-default, non-black color from score data
+                            //   (matches non-WebGL2 PFR bitmap rendering where sprite.color always wins)
+                            // - span has no color set (fill in missing values)
+                            if has_fore_color || (fg_color != ColorRef::PaletteIndex(255) && fg_color != ColorRef::Rgb(0, 0, 0)) || style.color.is_none() {
+                                style.color = match &text_fg_color {
+                                    ColorRef::Rgb(r, g, b) => {
+                                        Some(((*r as u32) << 16) | ((*g as u32) << 8) | (*b as u32))
+                                    }
+                                    ColorRef::PaletteIndex(idx) => {
+                                        match *idx {
+                                            0 => Some(0xFFFFFF),
+                                            255 => Some(0x000000),
+                                            _ => Some(0x000000),
+                                        }
+                                    }
+                                };
+                            }
+
+                            // Per-span bold/italic/underline are authoritative.
+                            // Lingo writes to `member.fontStyle` already rewrite
+                            // every span's flags via the fontstyle setter
+                            // (text.rs::set_member_prop), so member-level
+                            // font_style ⇒ span flags is always in sync without
+                            // a render-time override. Forcing them here would
+                            // also wipe per-span variations.
+
+                            StyledSpan {
+                                text: span.text.clone(),
+                                style,
+                            }
+                        }).collect())
+                    };
+
+                    // Ink 4 (NotCopy): Director displays the inverse of the Copy
+                    // colors. The RenderedText path composites with the Copy
+                    // shader (white bg keyed to alpha), so the inversion can't
+                    // happen in-shader — bake it into the text colors instead.
+                    // spectral-wizard's HELP title stacks an ink-4 copy of the
+                    // cream `help_header` behind the cream one to form a black
+                    // drop shadow (FFFBF0 → ~00040F).
+                    let (styled_spans_with_defaults, text_fg_color) = if ink == 4 {
+                        let inv_spans = styled_spans_with_defaults.map(|spans| {
+                            spans.into_iter().map(|mut s| {
+                                if let Some(c) = s.style.color {
+                                    s.style.color = Some(!c & 0xFFFFFF);
+                                }
+                                s
+                            }).collect::<Vec<_>>()
+                        });
+                        let inv_fg = match &text_fg_color {
+                            ColorRef::Rgb(r, g, b) => ColorRef::Rgb(255 - r, 255 - g, 255 - b),
+                            other => other.clone(),
+                        };
+                        (inv_spans, inv_fg)
+                    } else {
+                        (styled_spans_with_defaults, text_fg_color)
+                    };
+
+                    // Apply `scrollTop` the same way the field path does: shift
+                    // the draw origin upward by scroll_top so a scrollable text
+                    // member shows the scrolled-to portion (the MM custom scroll
+                    // bar sets help_text to boxType #fixed and drives scrollTop).
+                    // Positive scroll_top → negative effective top_spacing → the
+                    // first lines clip above the box top. Folding it into
+                    // top_spacing (which the cache key hashes) re-rasterizes the
+                    // texture on every scroll. keep_authored_height is already
+                    // forced below for non-#adjust box types, so the bitmap stays
+                    // at the box height instead of growing with the content.
+                    let text_scroll_top =
+                        text_member.info.as_ref().map(|i| i.scroll_top as i32).unwrap_or(0);
+                    let effective_top_spacing = (text_member.top_spacing as i32 - text_scroll_top)
+                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+
+                    // Build cache key from the final styled spans that will actually be rendered.
+                    let styled_spans_ref = styled_spans_with_defaults.as_ref().map(|s| s.as_slice());
+                    let text_has_focus = player.keyboard_focus_sprite == channel_num;
+                    let text_caret_blink = caret_blink_visible_now();
+                    let mut cache_key = RenderedTextCacheKey::new_with_styled_spans(
+                        member_ref.clone(),
+                        text,
+                        styled_spans_ref,
+                        ink,
+                        blend,
+                        text_fg_color.clone(),
+                        text_bg_color.clone(),
+                        text_has_focus,
+                        text_member.sel_start,
+                        text_member.sel_end,
+                        text_caret_blink,
+                        width,
+                        height,
+                        text_member.alignment,
+                        effective_word_wrap,
+                        &font_name,
+                        font_size,
+                        font_style,
+                        text_member.fixed_line_space,
+                        effective_top_spacing,
+                    );
+                    // For #fixed (and #limit/#scroll) text members the
+                    // authored member.height is the rendering box; content
+                    // longer than the box is clipped, never shrinks the
+                    // bitmap. Junkbot hint_text member 174 (#fixed) has
+                    // authored height=107 but only 2 source-text lines, so
+                    // measure_text returns ~34 — without keep_authored
+                    // the shrink branch crops to 34 and wraps body to ~5
+                    // visual lines that overflow off the bottom.
+                    //
+                    // Same logic applies to #adjust members whose text has
+                    // explicit \r/\n breaks (multi-paragraph authored
+                    // content): info_height represents the authored
+                    // multi-paragraph layout, content wraps at runtime
+                    // beyond the source-line count. Junkbot BossBot
+                    // member 137 (#adjust, info=224, 5 source lines) —
+                    // sum of per_line_spacings is 70 (5×14) but body
+                    // wraps to ~10 lines × 14 = 140 px. Without lock the
+                    // shrink branch crops the bitmap to 70 and ~6 wrapped
+                    // lines overflow.
+                    let box_type_unwrapped =
+                        text_member.box_type;
+                    let box_type_locked = box_type_unwrapped != BuiltInSymbol::Adjust;
+                    let text_has_breaks = text_member.text.contains('\r')
+                        || text_member.text.contains('\n');
+                    let multi_par_adjust_locked =
+                        box_type_unwrapped == BuiltInSymbol::Adjust && text_has_breaks;
+                    let transform_active =
+                        skew.abs() > 0.001 || rotation.abs() > 0.1;
+                    // A scrolled member must keep its authored height: the
+                    // shrink branch re-measures using effective_top_spacing,
+                    // which scroll_top has made negative, so the bitmap would
+                    // shrink by exactly the scrolled amount and crop the lines
+                    // the scroll was meant to expose. Same guard the field
+                    // path applies below.
+                    let scroll_active = text_scroll_top != 0;
+                    cache_key.transform_active = transform_active;
+                    cache_key.keep_authored_height = transform_active
+                        || scroll_active
+                        || box_type_locked
+                        || multi_par_adjust_locked;
+
+                    // Per-text-line line_spacing override from XMED par_runs.
+                    // Walk text positions for each line; for each, find the
+                    // par_run with largest position <= line_pos, and read
+                    // line_spacing from par_infos[run.par_info_index]. Empty
+                    // when the member has no per-paragraph spacing data, in
+                    // which case the renderer falls back to fixed_line_space.
+                    //
+                    // Only apply for text WITH explicit `\r`/`\n` breaks —
+                    // for wrap-only single-paragraph members (CS recycler
+                    // help) the par_run table covers a single text-line and
+                    // any non-default value would compress all wrap-induced
+                    // visual lines uniformly, clipping content.
+                    let text_has_breaks = text.contains('\n') || text.contains('\r');
+                    let _debug_member = cache_key.member_ref.cast_member;
+                    let _debug_text_len = text.len();
+                    let _debug_par_runs_len = text_member.par_runs.len();
+                    let _debug_par_infos_len = text_member.par_infos.len();
+                    // Compute both per_line_spacings (line_spacing override
+                    // per source text line) AND per_line_par_idx (par_info
+                    // index per source text line). The latter lets the
+                    // styled renderer detect source-paragraph transitions
+                    // and apply `\sa`/`\sb` boundary spacing once between
+                    // paragraphs (not per line).
+                    let (per_line_spacings, per_line_par_idx): (Vec<u16>, Vec<u16>) = if text_has_breaks
+                        && !text_member.par_runs.is_empty()
+                        && !text_member.par_infos.is_empty()
+                    {
+                        let mut spacings = Vec::new();
+                        let mut par_idxs = Vec::new();
+                        let mut line_start: u32 = 0;
+                        let mut idx: usize = 0;
+                        let chars: Vec<char> = text.chars().collect();
+                        loop {
+                            // Lookup par_info for line_start
+                            let mut active_idx: u16 = 0;
+                            let mut found = false;
+                            for run in &text_member.par_runs {
+                                if run.position <= line_start {
+                                    active_idx = run.par_info_index;
+                                    found = true;
+                                } else {
+                                    break;
+                                }
+                            }
+                            // Use the par_info's `line_spacing` verbatim,
+                            // including 0 ("auto"). Lines with par_info=0
+                            // fall through to the renderer's downstream
+                            // chain (`render_line_spacing` → `line.max_size`
+                            // → `line_height`) — typically the font's
+                            // natural cell. Substituting any non-zero
+                            // par_info value here was incorrect: Junkbot v1
+                            // brick-info member 139 has par_infos of mostly
+                            // 0 with par_info[2]=6 reserved for ONE empty
+                            // line — using 6 as a document default
+                            // collapsed every content line down from
+                            // ~12px to 6px. For members like level.num
+                            // where par_runs explicitly map content lines
+                            // to a non-zero par_info (par_info[2]=21
+                            // covers pos 0..35), the explicit match is
+                            // applied directly here, so no fallback is
+                            // needed in the common case either.
+                            let mut spacing = 0u16;
+                            if found {
+                                if let Some(pi) = text_member.par_infos.get(active_idx as usize) {
+                                    if pi.line_spacing > 0 {
+                                        spacing = pi.line_spacing as u16;
+                                    }
+                                }
+                            }
+                            spacings.push(spacing);
+                            par_idxs.push(active_idx);
+                            // Advance to next line break
+                            while idx < chars.len() && chars[idx] != '\r' && chars[idx] != '\n' {
+                                idx += 1;
+                            }
+                            if idx >= chars.len() { break; }
+                            // Skip a single \r, \n, or \r\n pair
+                            if chars[idx] == '\r' && idx + 1 < chars.len() && chars[idx + 1] == '\n' {
+                                idx += 2;
+                            } else {
+                                idx += 1;
+                            }
+                            line_start = idx as u32;
+                        }
+                        (spacings, par_idxs)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+
+                    TextureSource::RenderedText {
+                        cache_key,
+                        text: text.clone(),
+                        font_name,
+                        font_size,
+                        font_style,
+                        font_id: None,
+                        line_spacing: text_member.fixed_line_space,
+                        top_spacing: effective_top_spacing,
+                        member_top_spacing: text_member.top_spacing,
+                        bottom_spacing: text_member.bottom_spacing,
+                        width,
+                        height,
+                        wrap_width: width,
+                        text_fg_color,
+                        text_bg_color,
+                        styled_spans: styled_spans_with_defaults,
+                        alignment: text_member.alignment.clone(),
+                        word_wrap: effective_word_wrap,
+                        border: 0,
+                        box_drop_shadow: 0,
+                        scrollbar: None,
+                        tab_stops: text_member.tab_stops.clone(),
+                        per_line_spacings,
+                        per_line_par_idx,
+                        par_infos: text_member.par_infos.clone(),
+                        par_runs: text_member.par_runs.clone(),
+                        char_spacing: text_member.char_spacing,
+                    }
+                }
+                CastMemberType::Field(field_member) => {
+                    // Field member: editable text field
+                    let text = &field_member.text;
+
+                    // Use sprite_rect dimensions — get_concrete_sprite_rect already
+                    // computes the correct size from text_height/rect/borders
+                    let width = sprite_rect.width().max(1) as u32;
+                    let height = sprite_rect.height().max(1) as u32;
+                    // Text-wrap width must use `field.width` — the authored
+                    // text-area width — not `sprite.width`. Director's
+                    // sprite display rect is sprite.width (e.g. 348) but
+                    // wraps text at field.width (e.g. 324). For Habbo's
+                    // hotel-navigator help-text panel, wrapping at the
+                    // sprite width fit "Goombahs, Ghosts or Bowser --" on
+                    // one line, while Director correctly wraps after
+                    // "Ghosts or".
+                    let wrap_width = if field_member.width > 0 {
+                        (field_member.width as u32).min(width)
+                    } else {
+                        width
+                    };
+                    // A #scroll field's scrollbar lives INSIDE the box, so it
+                    // takes its width out of the text area rather than growing
+                    // the sprite. Summer Resort's "sign.text" shows both halves:
+                    // Director draws the same box we do, but wraps a word earlier
+                    // ("…the entrance / to the resort!" vs our "…the entrance to
+                    // the / resort!") because ~16px of the line is the scrollbar.
+                    let scrollbar_info = crate::player::score::field_scrollbar_for(
+                        player, field_member, sprite_rect.clone(),
+                    )
+                    .map(|sb| (sb, field_member.scroll_top as i32));
+                    let wrap_width = if scrollbar_info.is_some() {
+                        wrap_width.saturating_sub(FIELD_SCROLLBAR_WIDTH as u32).max(1)
+                    } else {
+                        wrap_width
+                    };
+
+                    // Check if this field has keyboard focus AND is editable.
+                    // Non-editable fields ignore focus state for the cursor-render
+                    // path: Director doesn't draw a caret on read-only fields even
+                    // if they happen to be the focus owner (e.g. Coke Studios'
+                    // `nav_v-ego_search_motto` is a non-editable text panel that
+                    // would otherwise show a caret at the end of the motto text).
+                    let has_focus = field_member.editable
+                        && player.keyboard_focus_sprite == channel_num;
+
+                    let mut style = 0u8;
+                    let style_lc = field_member.font_style.to_lowercase();
+                    if style_lc.contains("bold") {
+                        style |= 1;
+                    }
+                    if style_lc.contains("italic") {
+                        style |= 2;
+                    }
+                    if style_lc.contains("underline") {
+                        style |= 4;
+                    }
+
+                    // Build StyledSpans from STXT formatting_runs so the
+                    // renderer can apply per-character underline visually.
+                    // Use the field-level font/size/color as the DEFAULT
+                    // for each span — don't override font_size from each
+                    // run because Director field styling per-run is
+                    // style-only (bold/italic/underline), not size; a
+                    // per-run size from STXT can be a stale member-level
+                    // snapshot and would split words onto wrong-sized lines.
+                    // Snapshot the cast lib's font_table once so the per-run
+                    // bold/italic detection below can resolve `run.font_id`
+                    // to an actual font name (e.g. "Arial Italic") rather
+                    // than guessing via bit heuristics. Same lookup the
+                    // Lingo `.font` / `.fontStyle` chunk getters use — keeps
+                    // the renderer and the script-visible style in sync so
+                    // a run that reports `[#italic]` to Lingo also draws
+                    // italic on stage.
+                    let field_font_table: std::collections::HashMap<u16, String> = player
+                        .movie
+                        .cast_manager
+                        .get_cast(member_ref.cast_lib as u32)
+                        .map(|cl| cl.font_table.clone())
+                        .unwrap_or_default();
+                    let field_styled_spans: Option<Vec<crate::player::handlers::datum_handlers::cast_member::font::StyledSpan>>
+                        = if field_member.formatting_runs.len() >= 2 {
+                        use crate::player::handlers::datum_handlers::cast_member::font::{StyledSpan, HtmlStyle};
+                        let text_str = &field_member.text;
+                        // STXT formatting_runs use BYTE positions in
+                        // Director's text data. Build a byte→char index map
+                        // so multi-byte chars (ñ/ç/é in Narrative's
+                        // Spanish/Portuguese text) don't shift visual spans
+                        // by 1 char per multi-byte char before them.
+                        let mut byte_to_char: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+                        let mut total_chars: Vec<char> = Vec::new();
+                        for (ci, (bi, c)) in text_str.char_indices().enumerate() {
+                            byte_to_char.insert(bi, ci);
+                            total_chars.push(c);
+                        }
+                        byte_to_char.insert(text_str.len(), total_chars.len());
+                        let resolve_char = |byte_pos: usize| -> usize {
+                            // Snap to nearest known boundary <= byte_pos.
+                            // STXT positions should sit on char boundaries
+                            // but guard against malformed offsets.
+                            for b in (0..=byte_pos.min(text_str.len())).rev() {
+                                if let Some(&c) = byte_to_char.get(&b) { return c; }
+                            }
+                            0
+                        };
+                        let mut spans: Vec<StyledSpan> = Vec::new();
+                        let runs = &field_member.formatting_runs;
+                        // Detect whether the runs actually carry non-trivial
+                        // per-run sizes (≥6pt and at least one differing from
+                        // the member default). Director STXT runs that just
+                        // tag style changes typically share `font_size == 0`
+                        // or share the member's default; in that case keep
+                        // uniform sizing so Canvas2D anti-aliasing lands on
+                        // integer pixels (per-run sizes blur it). When the
+                        // movie actually authored per-section sizes (Fugue
+                        // No. 4 Narrative: 18pt section headers + 12pt body,
+                        // David's Notes 18pt title + 12pt body), feed the
+                        // real per-run sizes through — the PFR multi-span
+                        // path scales each run individually and wrap
+                        // positions then match Shockwave's layout.
+                        let member_size = field_member.font_size as i32;
+                        let per_run_sizing = {
+                            let mut seen_size: Option<i32> = None;
+                            let mut differs = false;
+                            for run in runs.iter() {
+                                let s = run.font_size as i32;
+                                if s < 6 { continue; }
+                                match seen_size {
+                                    None => seen_size = Some(s),
+                                    Some(prev) if prev != s => { differs = true; break; }
+                                    _ => {}
+                                }
+                            }
+                            if differs {
+                                true
+                            } else if let Some(s) = seen_size {
+                                member_size > 0 && s != member_size
+                            } else {
+                                false
+                            }
+                        };
+                        for (i, run) in runs.iter().enumerate() {
+                            let start = resolve_char(run.start_position as usize);
+                            let end = if i + 1 < runs.len() {
+                                resolve_char(runs[i + 1].start_position as usize)
+                            } else {
+                                total_chars.len()
+                            };
+                            if start >= total_chars.len() || end <= start {
+                                continue;
+                            }
+                            let end = end.min(total_chars.len());
+                            let span_text: String = total_chars[start..end].iter().collect();
+                            // Resolve the run's font name via the file's
+                            // Fmap/VWFM table. Movies that ship separate
+                            // "Arial", "Arial Bold", "Arial Italic" cast
+                            // members signal the variant by mapping the
+                            // run's `font_id` to one of those names — the
+                            // style byte often stays at 0x00. OR with the
+                            // style-byte bits so movies that author bold/
+                            // italic via the style byte (single Arial cast
+                            // member) still work.
+                            let resolved_font = field_font_table.get(&run.font_id);
+                            let name_bold = resolved_font
+                                .map(|n| n.to_ascii_lowercase().contains("bold"))
+                                .unwrap_or(false);
+                            let name_italic = resolved_font
+                                .map(|n| n.to_ascii_lowercase().contains("italic"))
+                                .unwrap_or(false);
+                            let bold = (run.style & 0x01) != 0 || name_bold;
+                            let italic = (run.style & 0x02) != 0 || name_italic;
+                            let underline = (run.style & 0x04) != 0;
+                            let span_font_size = if per_run_sizing && (run.font_size as i32) >= 6 {
+                                Some(run.font_size as i32)
+                            } else if field_member.font_size > 0 {
+                                Some(field_member.font_size as i32)
+                            } else {
+                                None
+                            };
+                            // Use the run's resolved font name (e.g.
+                            // "Arial Bold" / "Arial Italic") as the span's
+                            // font_face so the per-span atlas-loader in
+                            // render_text_to_texture can pick the correct
+                            // variant PFR atlas for that run. Without this
+                            // every span carries field_member.font ("Arial")
+                            // and the loader sees no variants to load.
+                            let span_font_face = resolved_font
+                                .cloned()
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| {
+                                    if field_member.font.is_empty() {
+                                        None
+                                    } else {
+                                        Some(field_member.font.clone())
+                                    }
+                                });
+                            // Per-run foreground color from the STXT run
+                            // (QuickDraw u16 channels → 8-bit). A pure-black
+                            // run (0,0,0) is Director's "unset/default" — leave
+                            // it None so it inherits the field's effective color
+                            // (sprite/member override, often navy). An explicit
+                            // non-black run color (e.g. the red "- 50 POINTS -
+                            // Get Stung!" line in SpongeBob's Scoring field)
+                            // overrides per-span. Packed 0xRRGGBB to match
+                            // HtmlStyle::color elsewhere.
+                            let run_color: Option<u32> = {
+                                let r = (run.color_r >> 8) as u32;
+                                let g = (run.color_g >> 8) as u32;
+                                let b = (run.color_b >> 8) as u32;
+                                if r == 0 && g == 0 && b == 0 {
+                                    None
+                                } else {
+                                    Some((r << 16) | (g << 8) | b)
+                                }
+                            };
+                            spans.push(StyledSpan {
+                                text: span_text,
+                                style: HtmlStyle {
+                                    font_face: span_font_face,
+                                    font_size: span_font_size,
+                                    color: run_color,
+                                    bg_color: None,
+                                    bold,
+                                    italic,
+                                    underline,
+                                    kerning: 0,
+                                    char_spacing: 0,
+                                    hyperlink: None,
+                                },
+                            });
+                        }
+                        if spans.is_empty() {
+                            None
+                        } else {
+                            Some(spans)
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Color priority for fields:
+                    // 1. Non-default RGB sprite color wins outright. Covers both
+                    //    score-frame-data tweens (FurniFactory; sprite.color = RGB but
+                    //    has_fore_color=false) and Lingo writes. Black is excluded so
+                    //    a sprite at default doesn't shadow member.color.
+                    // 2. Cast member `.color` set to RGB (CS convention).
+                    // 3. Sprite has_fore_color (Lingo touched it, palette index).
+                    // 4. STXT/FieldInfo fore_color (parse-time fallback).
+                    // 5. Sprite color as final fallback.
+                    let effective_fg = if matches!(fg_color, ColorRef::Rgb(..))
+                        && fg_color != ColorRef::Rgb(0, 0, 0)
+                    {
+                        fg_color.clone()
+                    } else if matches!(member.color, ColorRef::Rgb(..)) {
+                        member.color.clone()
+                    } else if has_fore_color {
+                        fg_color.clone()
+                    } else {
+                        field_member.fore_color.clone()
+                            .unwrap_or_else(|| fg_color.clone())
+                    };
+                    // Field bg priority:
+                    //   1. sprite.backColor IF it was explicitly set (Lingo
+                    //      `the backColor of sprite N` or score-frame-data
+                    //      tween) — Director honors those overrides for
+                    //      field sprites too.
+                    //   2. `member.bg_color`, which is initialized in
+                    //      cast_member.rs from FieldInfo and tracked by the
+                    //      `the bgColor of member` Lingo setter.
+                    // The previous fallback used `field_member.back_color`,
+                    // which is a parse-time snapshot and does NOT track
+                    // member-level Lingo writes — so a script that did
+                    // `set the bgColor of member "x" to red` would still
+                    // render with the original FieldInfo bg.
+                    let effective_bg = if has_back_color {
+                        bg_color.clone()
+                    } else {
+                        member.bg_color.clone()
+                    };
+
+                    debug!(
+                        "[FIELD] sprite#{} text='{}' ink={} font='{}' fontSize={} fg={:?} sprite.bg={:?} member.fg={:?} member.bg={:?} has_fore={} has_back={} -> eff_fg={:?} eff_bg={:?} box_type='{}' editable={} border={} size={}x{}",
+                        channel_num, text.chars().take(30).collect::<String>(), ink, field_member.font, field_member.font_size,
+                        fg_color, bg_color, field_member.fore_color, member.bg_color,
+                        has_fore_color, has_back_color, effective_fg, effective_bg,
+                        field_member.box_type, field_member.editable, field_member.border, width, height,
+                    );
+
+                    // `scrollTop` (Director 11.5 Scripting Dictionary p.1158)
+                    // is "the distance, in pixels, from the top of the field
+                    // cast member to the top of the field that is currently
+                    // visible". We implement it by shifting the text-draw
+                    // origin upward via top_spacing: a positive scroll_top
+                    // produces a negative effective top_spacing, so the
+                    // first lines render above the bitmap top (clipped) and
+                    // the visible content appears scrolled up. Hashing the
+                    // adjusted top_spacing into the cache key (which already
+                    // hashes top_spacing) makes the texture re-rasterize each
+                    // time scrollTop changes. Force keep_authored_height so
+                    // the bitmap stays at sprite height instead of shrinking
+                    // to fit the scrolled-up content.
+                    let scroll_top_i = field_member.scroll_top as i32;
+                    let effective_top_spacing = (field_member.top_spacing as i32 - scroll_top_i)
+                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                    let scroll_active = scroll_top_i != 0;
+
+                    // Include focus state in cache key so cursor state changes invalidate cache
+                    let field_caret_blink = caret_blink_visible_now();
+                    let mut cache_key = RenderedTextCacheKey::new_with_focus(
+                        member_ref.clone(),
+                        text,
+                        ink,
+                        blend,
+                        effective_fg.clone(),
+                        effective_bg.clone(),
+                        has_focus,
+                        field_member.sel_start,
+                        field_member.sel_end,
+                        field_caret_blink,
+                        width,
+                        height,
+                        field_member.alignment,
+                        field_member.word_wrap,
+                        &field_member.font,
+                        field_member.font_size,
+                        if style == 0 { None } else { Some(style) },
+                        field_member.fixed_line_space,
+                        effective_top_spacing,
+                    );
+                    let transform_active =
+                        skew.abs() > 0.001 || rotation.abs() > 0.1;
+                    // Paged/scrollable fields (box_type #scroll, #fixed,
+                    // #limit) must keep the bitmap at the sprite's
+                    // authored height regardless of how tall the
+                    // wrapped content is — otherwise switching from a
+                    // short to a long member (Narrative -> Spanish,
+                    // which has 28k chars wrapping to thousands of
+                    // pixels) blows the bitmap up to the full text
+                    // height and the overflow renders all over the
+                    // stage instead of clipping to the visible field.
+                    // #adjust is the only box_type where the field is
+                    // expected to grow to fit content.
+                    let box_clipped = matches!(
+                        field_member.box_type.as_str(),
+                        "scroll" | "fixed" | "limit"
+                    );
+                    cache_key.keep_authored_height = transform_active || scroll_active || box_clipped;
+                    cache_key.transform_active = transform_active;
+
+                    TextureSource::RenderedText {
+                        cache_key,
+                        text: text.clone(),
+                        font_name: field_member.font.clone(),
+                        font_size: field_member.font_size,
+                        font_style: if style == 0 { None } else { Some(style) },
+                        font_id: field_member.font_id,
+                        line_spacing: field_member.fixed_line_space,
+                        top_spacing: effective_top_spacing,
+                        member_top_spacing: field_member.top_spacing,
+                        bottom_spacing: 0,
+                        width,
+                        height,
+                        wrap_width,
+                        text_fg_color: effective_fg,
+                        text_bg_color: effective_bg,
+                        styled_spans: field_styled_spans,
+                        alignment: field_member.alignment.clone(),
+                        word_wrap: field_member.word_wrap,
+                        border: field_member.border,
+                        box_drop_shadow: field_member.box_drop_shadow,
+                        scrollbar: scrollbar_info,
+                        tab_stops: Vec::new(),
+                        per_line_spacings: Vec::new(),
+                        per_line_par_idx: Vec::new(),
+                        par_infos: Vec::new(),
+                        par_runs: Vec::new(),
+                        char_spacing: 0,
+                    }
+                }
+                CastMemberType::Button(button_member) => {
+                    // Button member: render to offscreen bitmap with button chrome
+                    let width = sprite_rect.width().max(1) as u32;
+                    let height = sprite_rect.height().max(1) as u32;
+                    TextureSource::ButtonBitmap {
+                        width,
+                        height,
+                        button_type: button_member.button_type.clone(),
+                        hilite: button_member.hilite,
+                        text: button_member.field.text.clone(),
+                        font_name: button_member.field.font.clone(),
+                        font_size: button_member.field.font_size,
+                        font_id: button_member.field.font_id,
+                        alignment: button_member.field.alignment.clone(),
+                        ink,
+                    }
+                }
+                CastMemberType::Flash(_) => {
+                    // Each sprite has its own Ruffle player instance (lazy-
+                    // created above on first render), so the per-sprite
+                    // bitmap is the only source we read here.
+                    let bitmap_ref_opt = player.flash_frame_buffers.get(&channel_num).copied();
+                    match bitmap_ref_opt {
+                        Some(bitmap_ref) if bitmap_ref != 0 => {
+                            TextureSource::Bitmap { image_ref: bitmap_ref, is_flash: true }
+                        }
+                        _ => return, // Instance not ready yet; first frame hasn't arrived.
+                    }
+                }
+                CastMemberType::Movie(_) => {
+                    // Linked Movie (`#movie`): the sub-player's stage was rendered
+                    // into the host's bitmap_manager by `render_nested_player_stages`,
+                    // keyed by this member. Composite it like a Flash frame buffer
+                    // (a plain Director bitmap).
+                    match player.nested_movie_images.get(&member_ref).copied() {
+                        Some(image_ref) if image_ref != 0 => {
+                            TextureSource::Bitmap { image_ref, is_flash: false }
+                        }
+                        _ => return, // Sub-player stage not rendered yet.
+                    }
+                }
+                CastMemberType::FilmLoop(film_loop) => {
+                    // Film loop: render the film loop's score to an offscreen bitmap.
+                    // Prefer info_rect (authoritative viewport from Director file).
+                    let info_rect = IntRect::from(
+                        film_loop.info.reg_point.0 as i32,
+                        film_loop.info.reg_point.1 as i32,
+                        film_loop.info.width as i32,
+                        film_loop.info.height as i32,
+                    );
+
+                    let sprite_dim_rect = &film_loop.initial_rect;
+                    let bitmap_dim_rect = crate::rendering::compute_filmloop_initial_rect_with_members(player, &member_ref);
+
+                    debug!(
+                        "FILMLOOP DIMS: member {}:{} sprite_rect {}x{} sprite_dim_rect ({},{},{},{}) {}x{} bitmap_dim_rect {:?} info_rect ({},{},{},{}) {}x{}",
+                        member_ref.cast_lib, member_ref.cast_member,
+                        sprite_width, sprite_height,
+                        sprite_dim_rect.left, sprite_dim_rect.top, sprite_dim_rect.right, sprite_dim_rect.bottom,
+                        sprite_dim_rect.width(), sprite_dim_rect.height(),
+                        bitmap_dim_rect.as_ref().map(|r| format!("({},{},{},{}) {}x{}", r.left, r.top, r.right, r.bottom, r.width(), r.height())),
+                        info_rect.left, info_rect.top, info_rect.right, info_rect.bottom,
+                        info_rect.width(), info_rect.height(),
+                    );
+
+                    let sprite_dims_match_stage = sprite_width > 0 && sprite_height > 0
+                        && (sprite_width - sprite_dim_rect.width()).abs() <= 1
+                        && (sprite_height - sprite_dim_rect.height()).abs() <= 1;
+                    filmloop_sprite_dims_match = sprite_dims_match_stage;
+
+                    let initial_rect = if info_rect.width() > 0 && info_rect.height() > 0 {
+                        info_rect.clone()
+                    } else if sprite_dims_match_stage {
+                        film_loop.initial_rect.clone()
+                    } else {
+                        bitmap_dim_rect.unwrap_or_else(|| film_loop.initial_rect.clone())
+                    };
+
+                    let width = initial_rect.width().max(1);
+                    let height = initial_rect.height().max(1);
+
+                    TextureSource::FilmLoop {
+                        initial_rect,
+                        width: width as u32,
+                        height: height as u32,
+                    }
+                }
+                CastMemberType::Shockwave3d(w3d) => {
+                    if w3d.parsed_scene.is_none() {
+                        warn!(
+                            "[3D] Sprite {} member {}:{} has NO parsed_scene — W3D parsing failed or data is empty (w3d_data len={})",
+                            channel_num, member_ref.cast_lib, member_ref.cast_member, w3d.w3d_data.len()
+                        );
+                    }
+                    if let Some(ref parsed_scene) = w3d.parsed_scene {
+                        // FBO dimensions from sprite rect
+                        let (w, h) = (sprite_rect.width().max(1) as u32, sprite_rect.height().max(1) as u32);
+                        {
+                            static RECT_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !RECT_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                debug!(
+                                    "[3D-RECT] sprite_rect=({},{},{},{}) fbo={}x{} loc=({},{}) sprite_wh=({},{}) regPt=({},{})",
+                                    sprite_rect.left, sprite_rect.top, sprite_rect.right, sprite_rect.bottom,
+                                    w, h, raw_loc.0, raw_loc.1, sprite_width, sprite_height,
+                                    w3d.info.reg_point.0, w3d.info.reg_point.1
+                                );
+                            }
+                        }
+                        // One pass per camera, in the sprite's camera order. Each camera
+                        // is resolved against the member that OWNS it, so a sprite can
+                        // composite worlds from several members the way Director does.
+                        use crate::director::chunks::w3d::types::W3dNodeType;
+                        let own_key = (member_ref.cast_lib, member_ref.cast_member);
+                        let mut cam_list: Vec<crate::player::sprite::SpriteCamera> =
+                            w3d_camera.iter().cloned().collect();
+                        cam_list.extend(w3d_extra_cams.iter().cloned());
+
+                        let mut passes: Vec<Shockwave3dPass> = Vec::new();
+                        for cam in &cam_list {
+                            let key = cam.member.unwrap_or(own_key);
+                            let resolved = if key == own_key {
+                                Some((parsed_scene.clone(), w3d.runtime_state.clone()))
+                            } else {
+                                let other = CastMemberRef { cast_lib: key.0, cast_member: key.1 };
+                                player.movie.cast_manager.find_member_by_ref(&other)
+                                    .and_then(|m| m.member_type.as_shockwave3d())
+                                    .and_then(|o| o.parsed_scene.as_ref()
+                                        .map(|sc| (sc.clone(), o.runtime_state.clone())))
+                            };
+                            let (pass_scene, pass_state) = match resolved {
+                                Some(v) => v,
+                                // Owning member isn't loaded (or isn't 3D) yet — skip
+                                // rather than render this member's world through it.
+                                None => continue,
+                            };
+                            let exists = pass_scene.nodes.iter().any(|n| {
+                                n.node_type == W3dNodeType::View
+                                    && n.name.eq_ignore_ascii_case(&cam.name)
+                            });
+                            if !exists {
+                                continue;
+                            }
+                            passes.push(Shockwave3dPass {
+                                member_key: key,
+                                scene: pass_scene,
+                                runtime_state: pass_state,
+                                camera: Some(Symbol::from_str(&cam.name)),
+                            });
+                        }
+                        if passes.is_empty() {
+                            // No camera list, or none resolved: single default pass on
+                            // the sprite's own member (the renderer picks DefaultView).
+                            passes.push(Shockwave3dPass {
+                                member_key: own_key,
+                                scene: parsed_scene.clone(),
+                                runtime_state: w3d.runtime_state.clone(),
+                                camera: w3d_camera.as_ref().map(|c| Symbol::from_str(&c.name)),
+                            });
+                        }
+                        TextureSource::Shockwave3dScene { width: w, height: h, passes }
+                    } else {
+                        return;
+                    }
+                }
+                _ => {
+                    // Unhandled member types are silently skipped
+                    return;
+                }
+            }
+        };
+
+        // For filmloops: override sprite_rect when the score has no explicit dimensions,
+        // or when bitmap dims are being used and the score dims don't match the texture.
+        // When sprite dims match the stage (filmloop_sprite_dims_match), the score
+        // dimensions are intentional and must not be overridden.
+        let texture_source = match texture_source {
+            TextureSource::FilmLoop { initial_rect, width, height } => {
+                let w = width as i32;
+                let h = height as i32;
+                let should_override = if filmloop_sprite_dims_match {
+                    sprite_width <= 0 || sprite_height <= 0
+                } else {
+                    sprite_width <= 0 || sprite_height <= 0
+                        || (sprite_width - w).abs() > 1 || (sprite_height - h).abs() > 1
+                };
+                if should_override {
+                    let reg_x = w / 2;
+                    let reg_y = h / 2;
+                    sprite_rect = IntRect::from(
+                        raw_loc.0 as i32 - reg_x,
+                        raw_loc.1 as i32 - reg_y,
+                        raw_loc.0 as i32 - reg_x + w,
+                        raw_loc.1 as i32 - reg_y + h,
+                    );
+                }
+
+                TextureSource::FilmLoop {
+                    initial_rect,
+                    width,
+                    height,
+                }
+            }
+            other => other,
+        };
+
+        // Get bitmap info for palette reference, bit depth, and use_alpha (only used for bitmap sprites)
+        let (bitmap_palette_ref, bitmap_bit_depth, bitmap_use_alpha) = match &texture_source {
+            TextureSource::Bitmap { image_ref, .. } => {
+                match player.bitmap_manager.get_bitmap(*image_ref) {
+                    Some(bitmap) => {
+                        (bitmap.palette_ref.clone(), bitmap.original_bit_depth, bitmap.use_alpha)
+                    }
+                    None => (PaletteRef::BuiltIn(get_system_default_palette()), 8, false),
+                }
+            }
+            TextureSource::SolidColor { .. } => {
+                // Solid colors use system default palette, no alpha
+                (PaletteRef::BuiltIn(get_system_default_palette()), 8, false)
+            }
+            TextureSource::RenderedText { .. } => {
+                // Rendered text uses 32-bit RGBA with alpha for transparent background
+                (PaletteRef::BuiltIn(get_system_default_palette()), 32, true)
+            }
+            TextureSource::FilmLoop { .. } => {
+                // Film loops are rendered as 32-bit RGBA with alpha
+                (PaletteRef::BuiltIn(get_system_default_palette()), 32, true)
+            }
+            TextureSource::ButtonBitmap { .. } => {
+                // Buttons are rendered as 32-bit RGBA with alpha
+                (PaletteRef::BuiltIn(get_system_default_palette()), 32, true)
+            }
+            TextureSource::ShapeBitmap { .. } | TextureSource::VectorShapeBitmap { .. } => {
+                // Shapes are rendered as 32-bit RGBA with alpha
+                (PaletteRef::BuiltIn(get_system_default_palette()), 32, true)
+            }
+            TextureSource::Shockwave3dScene { .. } => {
+                // 3D scenes rendered as 32-bit RGBA
+                (PaletteRef::BuiltIn(get_system_default_palette()), 32, true)
+            }
+        };
+
+        // Resolve colors to RGB for shader uniforms and colorize
+        let palettes = player.movie.cast_manager.palettes();
+        // Sprite foreColor/backColor palette indices are resolved against the bitmap's palette,
+        // so they work together correctly (e.g., index 248/255 in a custom 256-color palette).
+        let bg_color_rgb = resolve_color_ref(
+            &palettes,
+            &bg_color,
+            &bitmap_palette_ref,
+            bitmap_bit_depth,
+        );
+        let fg_color_rgb = resolve_color_ref(
+            &palettes,
+            &fg_color,
+            &bitmap_palette_ref,
+            bitmap_bit_depth,
+        );
+
+        // Build colorize parameters if colorize is active
+        // - For 1-bit bitmaps with ink 0, 1 or 36: ALWAYS apply foreColor/bgColor
+        //   (Director behavior - 1-bit bitmaps always use sprite colors)
+        // - For 2-8 bit indexed bitmaps: only colorize if has_fore_color or has_back_color is set via Lingo
+        // - For 32-bit bitmaps with ink 0, 8, 9: general colorize (requires has_fore_color or has_back_color)
+        // - For indexed bitmaps with ink 36: foreColor tinting for monochrome-style bitmaps
+        // Note: Ink 40 does NOT use foreColor tinting - it just uses color-key transparency
+        let is_indexed = bitmap_bit_depth >= 1 && bitmap_bit_depth <= 8;
+        let is_ink36_indexed = is_indexed && ink == 36;
+
+        let colorize_params = if bitmap_bit_depth == 1 && (ink == 0 || ink == 1 || ink == 36) {
+            // Ink 1 (Transparent) colorizes a 1-bit bitmap exactly as Copy and
+            // Background Transparent do — a 1-bit image carries coverage, not
+            // colour, so its two indices only mean anything once the sprite's
+            // fore/bgColor are substituted in. The CPU renderer already treats
+            // every ink this way (drawing.rs: index 0 transparent, index 1 drawn
+            // in the resolved foreColor); leaving ink 1 out here made the two
+            // renderers disagree.
+            //
+            // Merlin's Revenge draws its spell blast this way — 1-bit artwork
+            // (decoded into an 8-bit buffer, so `member.depth` reports 8 while
+            // `original_bit_depth` stays 1), ink 1, sprite.color rgb(245,195,5),
+            // palette systemWin. With no colorize params the raw indices went to
+            // the shader, and systemWin maps index 255 to BLACK — a correctly
+            // shaped, completely black blast.
+            //
+            // The apply_fg/apply_bg guards below still hold, so a sprite sitting
+            // on Director's defaults (foreColor black, bgColor white) is not
+            // tinted; only an explicitly set or non-default colour is.
+            let apply_fg = has_fore_color || fg_color_rgb != (0, 0, 0);
+            let apply_bg = has_back_color || bg_color_rgb != (255, 255, 255);
+            Some((
+                apply_fg,
+                apply_bg,
+                fg_color_rgb.0,
+                fg_color_rgb.1,
+                fg_color_rgb.2,
+                bg_color_rgb.0,
+                bg_color_rgb.1,
+                bg_color_rgb.2,
+            ))
+        } else if is_ink36_indexed && has_fore_color {
+            // Ink 36 indexed: apply foreColor to foreground pixels (index 255 or black)
+            // Only when foreColor was explicitly set via Lingo/tweening
+            Some((
+                true,
+                true,
+                fg_color_rgb.0,
+                fg_color_rgb.1,
+                fg_color_rgb.2,
+                bg_color_rgb.0,
+                bg_color_rgb.1,
+                bg_color_rgb.2,
+            ))
+        } else if (has_fore_color || has_back_color) && (
+            // 32-bit colorize (ink 0, 8, 9, 36)
+            //   ink:36 needs has_fore_color so vector-shape sprites that
+            //   carry a sprite.color tint (e.g. CS private-studio
+            //   `floor_shape_a` with sprite.color = aColorData.texturecolor)
+            //   get the multiplicative tint applied — without it, the
+            //   shape renders its raw pink gradient and blends pink over
+            //   the destination instead of producing the wood-tinted
+            //   color the texturecolor multiply was meant to give.
+            (bitmap_bit_depth == 32 && (ink == 0 || ink == 8 || ink == 9 || ink == 36)) ||
+            // Indexed (2-8 bit) colorize: ink 0 (Copy palette interpolation),
+            // ink 8 (Matte) and ink 9 (Mask) — all three apply the
+            // foreColor→bgColor lerp on near-grayscale pixels in
+            // `bitmap_to_rgba`. Mirrors `drawing.rs::allow_colorize` which
+            // already lists `(d, 8) | (d, 9) if d <= 8 => true` — without
+            // ink 8 here, CS private-studio wall color sprites (`_b_`
+            // members) couldn't tint via sprite.color/sprite.bgColor and
+            // walls rendered untinted gray instead of brick red.
+            (bitmap_bit_depth >= 2 && bitmap_bit_depth <= 8 && (ink == 0 || ink == 8 || ink == 9))
+        ) {
+            // Bitmap colorization defaults: foreColor defaults to black (0,0,0),
+            // bgColor defaults to white (255,255,255). Only apply substitution when
+            // the sprite has EXPLICITLY set (has_*_color=true) AND the value differs
+            // from the default — so a sprite with defaults doesn't tint the bitmap.
+            Some((
+                fg_color_rgb != (0, 0, 0) && has_fore_color,
+                bg_color_rgb != (255, 255, 255) && has_back_color,
+                fg_color_rgb.0,
+                fg_color_rgb.1,
+                fg_color_rgb.2,
+                bg_color_rgb.0,
+                bg_color_rgb.1,
+                bg_color_rgb.2,
+            ))
+        } else {
+            None
+        };
+
+        // Get or create texture based on source type
+        // For bitmaps, pass the ink so the texture has the correct matte mask baked in
+        // For ink 8, we pass sprite's bgColor for matte computation
+        // (this matches Canvas2D's copy_pixels_with_params which uses sprite bgColor)
+        // Note: Ink 33 uses shader color-key, not texture matte
+        // Colorize is also baked into the texture when has_fore_color or has_back_color is set
+
+        let is_rendered_text = matches!(texture_source, TextureSource::RenderedText { .. });
+        // The floor sampling rule was measured on authored bitmaps; a text,
+        // field or shape texture whose sprite rect is a pixel short keeps the
+        // centre rule it always had.
+        let floor_rule = matches!(texture_source, TextureSource::Bitmap { is_flash: false, .. });
+        let is_button_alpha_matte = matches!(texture_source, TextureSource::ButtonBitmap { ink: i, .. } if i == 2 || i == 36 || i == 8 || i == 7);
+
+        // These sources rasterize a FRESH texture here every frame and, unlike
+        // Bitmap / FilmLoop / RenderedText, do NOT put it in any cache. Dropping a
+        // `WebGlTexture` handle does not call `gl.deleteTexture`, so without an
+        // explicit delete after drawing, each frame leaks one GL texture per such
+        // sprite — GPU/JS memory climbs and never comes back (the cause of the
+        // spike on vector-shape-heavy movies like Infestation and lore). Deleted
+        // after the draw below; cached sources must NOT be deleted (their texture
+        // is shared with the cache).
+        let owns_dynamic_texture = matches!(
+            texture_source,
+            TextureSource::VectorShapeBitmap { .. }
+                | TextureSource::ShapeBitmap { .. }
+                | TextureSource::ButtonBitmap { .. }
+        );
+
+        // Native size of the source texture, when it comes from a bitmap member.
+        // Used below to decide whether this draw is minifying enough to warrant
+        // averaged (mipmapped) sampling instead of point sampling.
+        let mut tex_source_size: Option<(u32, u32)> = None;
+
+        let tex = match texture_source {
+            TextureSource::Bitmap { image_ref, is_flash } => {
+                // Pass sprite's bgColor for matte/transparency computation for inks that need it
+                let sprite_bg_for_matte = if ink == 7 || ink == 8 || ink == 9 || ink == 36 || ink == 37 || ink == 39 || ink == 40 || ink == 41 {
+                    Some(bg_color_rgb)
+                } else {
+                    None
+                };
+
+                match self.get_or_create_texture(player, &member_ref, image_ref, ink, colorize_params, sprite_bg_for_matte, is_flash) {
+                    Some((tex, w, h)) => {
+                        tex_source_size = Some((w, h));
+                        tex
+                    }
+                    None => return,
+                }
+            }
+            TextureSource::SolidColor { r, g, b } => {
+                // For inks that make bgColor pixels transparent (7, 8, 36, 40),
+                // if the solid foreground color matches the resolved bgColor,
+                // the entire shape would be invisible — skip rendering.
+                if ink == 3 || ink == 7 || ink == 8 || ink == 36 || ink == 40 {
+                    if (r, g, b) == bg_color_rgb {
+                        return;
+                    }
+                }
+                self.get_or_create_solid_color_texture(r, g, b)
+            }
+            TextureSource::RenderedText {
+                ref cache_key,
+                ref text,
+                ref font_name,
+                font_size,
+                font_style,
+                font_id,
+                line_spacing,
+                top_spacing,
+                member_top_spacing,
+                bottom_spacing,
+                width,
+                height,
+                wrap_width,
+                ref text_fg_color,
+                ref text_bg_color,
+                ref styled_spans,
+                ref alignment,
+                word_wrap,
+                border,
+                box_drop_shadow,
+                scrollbar,
+                ref tab_stops,
+                ref per_line_spacings,
+                ref per_line_par_idx,
+                ref par_infos,
+                ref par_runs,
+                char_spacing,
+            } => {
+                if text.contains('\t') || !tab_stops.is_empty() {
+                    warn!(
+                        "[webgl2 RenderedText] member={}:{} tabs={} has_tab={} text='{}'",
+                        cache_key.member_ref.cast_lib, cache_key.member_ref.cast_member,
+                        tab_stops.len(), text.contains('\t'),
+                        text.chars().take(40).collect::<String>()
+                    );
+                }
+                // Check cache first
+                if let Some(cached) = self.rendered_text_cache.get(cache_key) {
+                    // Update sprite_rect to match cached texture dimensions —
+                    // this lets text members visually crop to actual content
+                    // height when displayed flat. Skipped when a skew/rotation
+                    // transform is active: the texture is rendered at the
+                    // member-authored size (lines × member.height) so the
+                    // texture STRETCHES into the larger sprite quad — like
+                    // Director's #fixed members. Adjusting sprite_rect to the
+                    // smaller texture height would collapse the parallelogram
+                    // and erase the stretch (e.g. CS clock display had its
+                    // 52×48 quad cut to 52×36 with text at natural size,
+                    // instead of stretched into the full 52×48).
+                    let has_transform = skew.abs() > 0.001 || rotation.abs() > 0.1;
+                    let actual_h = cached.height as i32;
+                    if actual_h != sprite_rect.height() && !has_transform {
+                        sprite_rect = IntRect::from(
+                            sprite_rect.left, sprite_rect.top,
+                            sprite_rect.right, sprite_rect.top + actual_h,
+                        );
+                    }
+
+                    cached.texture.clone()
+                } else {
+                    // Render text to a bitmap and upload as texture
+                    match self.render_text_to_texture(
+                        player,
+                        cache_key,
+                        text,
+                        font_name,
+                        font_size,
+                        font_style,
+                        font_id,
+                        line_spacing,
+                        top_spacing,
+                        member_top_spacing,
+                        bottom_spacing,
+                        width,
+                        height,
+                        wrap_width,
+                        ink,
+                        blend,
+                        text_fg_color,
+                        text_bg_color,
+                        styled_spans.as_ref(),
+                        *alignment,
+                        word_wrap,
+                        border,
+                        box_drop_shadow,
+                        scrollbar,
+                        tab_stops,
+                        per_line_spacings.as_slice(),
+                        per_line_par_idx.as_slice(),
+                        par_infos.as_slice(),
+                        par_runs.as_slice(),
+                        char_spacing,
+                    ) {
+                        Some((tex, _actual_w, actual_h)) => {
+                            // Update sprite_rect to match actual rendered dimensions.
+                            // Skipped when a transform is active — see comment on
+                            // the cached-path branch above for the same gate.
+                            let has_transform = skew.abs() > 0.001 || rotation.abs() > 0.1;
+                            if actual_h as i32 != sprite_rect.height() && !has_transform {
+                                sprite_rect = IntRect::from(
+                                    sprite_rect.left, sprite_rect.top,
+                                    sprite_rect.right, sprite_rect.top + actual_h as i32,
+                                );
+                            }
+                            tex
+                        }
+                        None => return,
+                    }
+                }
+            }
+            TextureSource::FilmLoop { initial_rect, width, height, .. } => {
+                // Cache filmloop textures per-frame: use the filmloop's current_frame as version
+                // so the cache hits when the frame hasn't changed, but re-renders on frame advance
+                let filmloop_frame = player.movie.cast_manager
+                    .find_member_by_ref(&member_ref)
+                    .and_then(|cm| {
+                        if let CastMemberType::FilmLoop(fl) = &cm.member_type { Some(fl.current_frame) } else { None }
+                    })
+                    .unwrap_or(0);
+
+                let cache_key = TextureCacheKey {
+                    member_ref: member_ref.clone(),
+                    // Filmloops don't share a per-sprite bitmap pool like
+                    // Flash members do — one filmloop member renders the
+                    // same offscreen for every sprite that draws it, so 0
+                    // works as a sentinel here.
+                    image_ref: 0,
+                    ink: ink as i32,
+                    colorize: None,
+                    sprite_bg_color: None,
+                };
+
+                if !self.texture_cache.needs_update(&cache_key, filmloop_frame) {
+                    if let Some(cached) = self.texture_cache.get(&cache_key) {
+                        cached.texture.clone()
+                    } else {
+                        // Shouldn't happen, but fall through to render
+                        return;
+                    }
+                } else {
+                    // Render the film loop's score to an offscreen bitmap
+                    let mut filmloop_bitmap = Bitmap::new(
+                        width as u16,
+                        height as u16,
+                        32,
+                        32,
+                        8, // alpha_depth = 8 for transparency support
+                        PaletteRef::BuiltIn(get_system_default_palette()),
+                    );
+                    filmloop_bitmap.use_alpha = true;
+                    filmloop_bitmap.data.fill(0);
+
+                    render_score_to_bitmap_with_offset(
+                        player,
+                        &ScoreRef::FilmLoop(member_ref.clone()),
+                        &mut filmloop_bitmap,
+                        None,
+                        IntRect::from_size(0, 0, width as i32, height as i32),
+                        (initial_rect.left, initial_rect.top),
+                        Some(FilmLoopParentProps {
+                            ink: ink as u32,
+                            color: fg_color.clone(),
+                            bg_color: bg_color.clone(),
+                        }),
+                    );
+
+                    let texture = match self.context.create_texture() {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
+                    if self.context.upload_texture_rgba(&texture, width, height, &filmloop_bitmap.data).is_err() {
+                        return;
+                    }
+                    let gl = self.context.gl().clone();
+                    self.texture_cache.insert(&gl, cache_key, texture.clone(), width, height, filmloop_frame);
+                    texture
+                }
+            }
+            TextureSource::ButtonBitmap {
+                width, height, button_type, hilite, text,
+                font_name, font_size, font_id, alignment, ink: button_ink,
+            } => {
+                use crate::player::cast_member::ButtonType;
+
+                let w = width as i32;
+                let h = height as i32;
+
+                // Create a 32-bit RGBA bitmap for the button
+                let mut btn_bitmap = Bitmap::new(
+                    width as u16, height as u16, 32, 32, 8,
+                    PaletteRef::BuiltIn(get_system_default_palette()),
+                );
+                btn_bitmap.use_alpha = true;
+                btn_bitmap.data.fill(0); // Start fully transparent
+
+                let palettes = player.movie.cast_manager.palettes();
+
+                // Only push buttons invert everything; radio/checkbox keep black text
+                let is_push = matches!(button_type, ButtonType::PushButton);
+                let (frame_color, fill_color, text_color): ((u8,u8,u8),(u8,u8,u8),(u8,u8,u8)) = if hilite && is_push {
+                    // Hilited push button: white frame, white text, black fill
+                    ((255,255,255), (0,0,0), (255,255,255))
+                } else {
+                    // Normal / radio/checkbox: black frame, black text, white fill
+                    ((0,0,0), (255,255,255), (0,0,0))
+                };
+
+                // For matte-like inks (bgTransparent 36, Matte 8, Not Ghost 7),
+                // skip the fill and rely on the alpha channel instead of color-keying.
+                // The shader will use alpha-based compositing for these inks.
+                let use_alpha_matte = button_ink == 2 || button_ink == 36 || button_ink == 8 || button_ink == 7;
+
+                match button_type {
+                    ButtonType::PushButton => {
+                        // Fill interior with fill color — skip for matte-like inks
+                        // to avoid AA text fringe from color-keying near-white pixels
+                        if !use_alpha_matte {
+                            btn_bitmap.fill_rect(1, 1, w - 1, h - 1, fill_color, &palettes, 1.0);
+                        }
+                        // Draw border (top, bottom, left, right)
+                        btn_bitmap.fill_rect(2, 0, w - 2, 1, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(2, h - 1, w - 2, h, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(0, 2, 1, h - 2, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(w - 1, 2, w, h - 2, frame_color, &palettes, 1.0);
+                        // Corner pixels for rounded corners (1px radius)
+                        btn_bitmap.fill_rect(1, 0, 2, 1, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(w - 2, 0, w - 1, 1, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(0, 1, 1, 2, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(w - 1, 1, w, 2, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(1, h - 1, 2, h, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(w - 2, h - 1, w - 1, h, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(0, h - 2, 1, h - 1, frame_color, &palettes, 1.0);
+                        btn_bitmap.fill_rect(w - 1, h - 2, w, h - 1, frame_color, &palettes, 1.0);
+                        // Set corner pixels fully transparent for rounded look
+                        for &(cx, cy) in &[(0i32, 0i32), (w-1, 0), (0, h-1), (w-1, h-1)] {
+                            if cx >= 0 && cy >= 0 && cx < w && cy < h {
+                                let idx = ((cy * w + cx) * 4) as usize;
+                                if idx + 3 < btn_bitmap.data.len() {
+                                    btn_bitmap.data[idx + 3] = 0;
+                                }
+                            }
+                        }
+                    }
+                    ButtonType::CheckBox => {
+                        let box_y = 0;
+                        // Box outline
+                        btn_bitmap.fill_rect(0, box_y, 10, box_y + 1, (0,0,0), &palettes, 1.0);
+                        btn_bitmap.fill_rect(0, box_y + 9, 10, box_y + 10, (0,0,0), &palettes, 1.0);
+                        btn_bitmap.fill_rect(0, box_y, 1, box_y + 10, (0,0,0), &palettes, 1.0);
+                        btn_bitmap.fill_rect(9, box_y, 10, box_y + 10, (0,0,0), &palettes, 1.0);
+                        // White fill inside
+                        btn_bitmap.fill_rect(1, box_y + 1, 9, box_y + 9, (255,255,255), &palettes, 1.0);
+                        // Make the text area opaque
+                        for y in 0..h {
+                            for x in 12..w {
+                                let idx = ((y * w + x) * 4) as usize;
+                                if idx + 3 < btn_bitmap.data.len() && btn_bitmap.data[idx + 3] == 0 {
+                                    btn_bitmap.data[idx + 3] = 1; // minimal alpha so it's not cut
+                                }
+                            }
+                        }
+                        if hilite {
+                            for i in 1..9 {
+                                btn_bitmap.fill_rect(i, box_y + i, i + 1, box_y + i + 1, (0,0,0), &palettes, 1.0);
+                                btn_bitmap.fill_rect(9 - i, box_y + i, 10 - i, box_y + i + 1, (0,0,0), &palettes, 1.0);
+                            }
+                        }
+                    }
+                    ButtonType::RadioButton => {
+                        let base_x = 0;
+                        let base_y = 0;
+                        // Outer circle outline (midpoint circle, radius 5, center 5,5)
+                        let circle_points: &[(i32, i32)] = &[
+                            (4,0),(5,0),(6,0),
+                            (3,1),(7,1),
+                            (2,2),(8,2),
+                            (1,3),(9,3),
+                            (0,4),(10,4),
+                            (0,5),(10,5),
+                            (0,6),(10,6),
+                            (1,7),(9,7),
+                            (2,8),(8,8),
+                            (3,9),(7,9),
+                            (4,10),(5,10),(6,10),
+                        ];
+                        for &(px, py) in circle_points {
+                            btn_bitmap.fill_rect(base_x + px, base_y + py, base_x + px + 1, base_y + py + 1, (0,0,0), &palettes, 1.0);
+                        }
+                        if hilite {
+                            // Filled inner circle (radius 2, center 5,5)
+                            btn_bitmap.fill_rect(base_x + 4, base_y + 3, base_x + 7, base_y + 4, (0,0,0), &palettes, 1.0);
+                            btn_bitmap.fill_rect(base_x + 3, base_y + 4, base_x + 8, base_y + 5, (0,0,0), &palettes, 1.0);
+                            btn_bitmap.fill_rect(base_x + 3, base_y + 5, base_x + 8, base_y + 6, (0,0,0), &palettes, 1.0);
+                            btn_bitmap.fill_rect(base_x + 3, base_y + 6, base_x + 8, base_y + 7, (0,0,0), &palettes, 1.0);
+                            btn_bitmap.fill_rect(base_x + 4, base_y + 7, base_x + 7, base_y + 8, (0,0,0), &palettes, 1.0);
+                        }
+                    }
+                }
+
+                // Draw text label
+                let chrome_offset_x = match button_type {
+                    ButtonType::CheckBox => 13, // 10px box + 3px gap
+                    ButtonType::RadioButton => 14, // 11px circle + 3px gap
+                    _ => 0,
+                };
+
+                // Load font and draw text
+                let font_opt = player.font_manager.get_font_with_cast_and_bitmap(
+                    &font_name,
+                    &player.movie.cast_manager,
+                    &mut player.bitmap_manager,
+                    Some(font_size),
+                    None,
+                );
+                let font_loaded = font_opt.or_else(|| {
+                    if let Some(id) = font_id {
+                        if let Some(fref) = player.font_manager.font_by_id.get(&id).copied() {
+                            player.font_manager.fonts.get(&fref).cloned()
+                        } else { None }
+                    } else { None }
+                });
+
+                let text_area_w = w - chrome_offset_x;
+                let is_pfr_font = font_loaded.as_ref().map_or(false, |f| f.char_widths.is_some());
+
+                if let (true, Some(font)) = (is_pfr_font, &font_loaded) {
+                    if let Some(font_bmp) = player.bitmap_manager.get_bitmap(font.bitmap_ref) {
+                        let wrapped_lines = Bitmap::wrap_text_lines(&text, font, text_area_w);
+                        let line_h = font.char_height as i32;
+                        let total_text_h = (wrapped_lines.len() as i32) * line_h;
+                        // Push buttons center text vertically; radio/checkbox start at top
+                        let text_y = if is_push {
+                            ((h - total_text_h) / 2).max(0)
+                        } else {
+                            0
+                        };
+
+                        let params = CopyPixelsParams {
+                            blend: 100,
+                            ink: 36, // bg transparent
+                            color: ColorRef::Rgb(text_color.0, text_color.1, text_color.2),
+                            bg_color: ColorRef::Rgb(255, 255, 255),
+                            mask_image: None,
+                            is_text_rendering: true,
+                            rotation: 0.0,
+                            skew: 0.0,
+                            sprite: None,
+                            mask_offset: (0, 0),
+                            original_dst_rect: None,
+                            bg_color_explicit: false,
+                            fore_color_explicit: false,
+                            ink9_mask_bitmap: None, ink9_mask_offset: (0, 0),
+                            floor_rule: false,
+                        };
+                        btn_bitmap.draw_text_wrapped(
+                            &text, font, font_bmp,
+                            chrome_offset_x, text_y,
+                            text_area_w, alignment,
+                            params, &palettes, 0, 0,
+                        );
+                    }
+                } else {
+                    // Use native Canvas2D rendering for system fonts (Arial etc.)
+                    let native_font_name = if font_name.is_empty() { "Arial".to_string() } else { font_name.clone() };
+                    let native_font_size = if font_size > 0 { font_size as i32 } else { 12 };
+                    let tc = ((text_color.0 as u32) << 16)
+                        | ((text_color.1 as u32) << 8)
+                        | (text_color.2 as u32);
+
+                    let span = StyledSpan {
+                        text: text.clone(),
+                        style: HtmlStyle {
+                            font_face: Some(native_font_name),
+                            font_size: Some(native_font_size),
+                            color: Some(tc),
+                            ..HtmlStyle::default()
+                        },
+                    };
+
+                    let text_alignment: TextAlignment = alignment.into();
+
+                    // Push buttons center text vertically; radio/checkbox start at top
+                    let text_y = if is_push {
+                        ((h - native_font_size) / 2).max(0)
+                    } else {
+                        0
+                    };
+
+                    if let Err(e) = FontMemberHandlers::render_native_text_to_bitmap(
+                        &mut btn_bitmap,
+                        &[span],
+                        chrome_offset_x,
+                        text_y,
+                        text_area_w,
+                        h,
+                        text_alignment,
+                        text_area_w,
+                        true,
+                        None,
+                        0,
+                        0,
+                        0,
+                        &[],
+                        &[],
+                        &[],
+                    ) {
+                        warn!("Native text render error for Button (WebGL2): {:?}", e);
+                    }
+                }
+
+                // Upload button bitmap as texture
+                let texture = match self.context.create_texture() {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                if self.context.upload_texture_rgba(&texture, width, height, &btn_bitmap.data).is_err() {
+                    return;
+                }
+                texture
+            }
+            TextureSource::ShapeBitmap {
+                width, height, shape_info, fg_color, bg_color, tile_palette, custom_tile,
+            } => {
+                use crate::director::enums::ShapeType;
+
+                let w = width as i32;
+                let h = height as i32;
+
+                let mut shape_bitmap = Bitmap::new(
+                    width as u16, height as u16, 32, 32, 8,
+                    PaletteRef::BuiltIn(get_system_default_palette()),
+                );
+                shape_bitmap.use_alpha = true;
+                shape_bitmap.data.fill(0);
+
+                let palettes = player.movie.cast_manager.palettes();
+                let filled = shape_info.fill_type != 0;
+                // Director stores the border width 1-BASED: file 1 = no border,
+                // 2 = 1px, … 6 = 5px (max). That is the same encoding the Lingo
+                // `lineSize of member` getter already decodes with `raw - 1`
+                // (cast_member_ref.rs), verified against Director on a shape
+                // authored with no border.
+                //
+                // The decode does not depend on `filled` — it is one byte with one
+                // meaning. Applying `-1` only to unfilled shapes and `.max(1)` to
+                // filled ones gave every filled shape a 1px foreColor outline it
+                // was never authored with, which reads as a black border around
+                // each shape (summerresort's map tiles: filled, pattern-tiled, no
+                // authored border).
+                let thickness = (shape_info.line_thickness as i32) - 1;
+
+                match shape_info.shape_type {
+                    ShapeType::Rect => {
+                        if filled {
+                            // VWTL custom tile (a bitmap region) takes precedence.
+                            // The shape is a local texture (0,0,w,h), so phase the
+                            // tile by the sprite's stage origin.
+                            if let Some((src, tile_rect, origin)) = custom_tile.as_ref() {
+                                shape_bitmap.fill_rect_custom_tile(
+                                    &palettes, src, tile_rect.clone(),
+                                    crate::player::geometry::IntRect::from(0, 0, w, h),
+                                    *origin,
+                                );
+                            } else
+                            // Tile patterns (57-64): blit the tile's palette
+                            // indices through the pre-resolved frame palette.
+                            if let (Some(tile), Some(cache)) = (
+                                crate::player::bitmap::builtin_tiles::tile_for_pattern(shape_info.pattern),
+                                tile_palette.as_ref(),
+                            ) {
+                                let tw = tile.w as i32;
+                                let th = tile.h as i32;
+                                for yy in 0..h {
+                                    let row = (yy.rem_euclid(th)) as usize * tile.w as usize;
+                                    for xx in 0..w {
+                                        let tx = (xx.rem_euclid(tw)) as usize;
+                                        let color = cache[tile.px[row + tx] as usize];
+                                        shape_bitmap.set_pixel(xx, yy, color, &palettes);
+                                    }
+                                }
+                            } else if let Some(pat) =
+                                crate::player::bitmap::quickdraw_patterns::quickdraw_pattern(shape_info.pattern)
+                            {
+                                // 1-bit QuickDraw patterns (1-56): set bit = fore,
+                                // clear = back. Recoloured, no palette remap.
+                                shape_bitmap.fill_rect_pattern_1bit(0, 0, w, h, pat, fg_color, bg_color, &palettes, 1.0);
+                            } else {
+                                shape_bitmap.fill_rect(0, 0, w, h, fg_color, &palettes, 1.0);
+                            }
+                        }
+                        if thickness > 0 {
+                            for t in 0..thickness {
+                                shape_bitmap.stroke_rect(t, t, w - t, h - t, fg_color, &palettes, 1.0);
+                            }
+                        }
+                    }
+                    ShapeType::OvalRect => {
+                        let radius = 12;
+                        if filled {
+                            shape_bitmap.fill_round_rect(0, 0, w, h, radius, fg_color, &palettes, 1.0);
+                        }
+                        if thickness > 0 {
+                            shape_bitmap.stroke_round_rect(0, 0, w, h, radius, fg_color, &palettes, 1.0, thickness);
+                        }
+                    }
+                    ShapeType::Oval => {
+                        if filled {
+                            shape_bitmap.fill_ellipse(0, 0, w, h, fg_color, &palettes, 1.0);
+                        }
+                        if thickness > 0 {
+                            shape_bitmap.stroke_ellipse(0, 0, w, h, fg_color, &palettes, 1.0, thickness);
+                        }
+                    }
+                    ShapeType::Line => {
+                        // A #line member is nothing but its line, so it never
+                        // vanishes — Director draws lineSize 0 as a 1px hairline.
+                        // Floor at 1 AFTER the 1-based decode, so file 3 draws 2px
+                        // rather than 3px. (The floor itself is inferred: the
+                        // dictionary's `lineSize` entry documents the property as a
+                        // pixel thickness but says nothing about 0 on a #line.)
+                        let t = ((shape_info.line_thickness as i32) - 1).max(1);
+                        if shape_info.line_direction == 6 {
+                            shape_bitmap.draw_line_thick(0, h - 1, w - 1, 0, fg_color, &palettes, 1.0, t);
+                        } else {
+                            shape_bitmap.draw_line_thick(0, 0, w - 1, h - 1, fg_color, &palettes, 1.0, t);
+                        }
+                    }
+                    ShapeType::Unknown => {
+                        shape_bitmap.fill_rect(0, 0, w, h, fg_color, &palettes, 1.0);
+                    }
+                }
+
+                // Bake the bgColor key into the texture's alpha for the inks that
+                // treat the background colour as transparent.
+                //
+                // A shape rasterizes OPAQUE — a pattern writes `back` for its clear
+                // bits, a tile writes every source pixel, a solid fill covers the
+                // whole rect — so the only thing that could make the background
+                // disappear was the shader's runtime colour key. That key is
+                // unreliable here for two reasons:
+                //
+                // - Its `u_bg_color` is resolved against
+                //   `PaletteRef::BuiltIn(get_system_default_palette())`, because
+                //   that is what the ShapeBitmap arm reports as the source
+                //   "bitmap palette". The pixels above were resolved against the
+                //   FRAME palette (or, for a custom tile, the tile member's own
+                //   palette), so the same index yields two different RGBs and the
+                //   key silently misses.
+                // - `colorize_baked` forces the tolerance to 0 whenever colorize
+                //   params exist, but this arm never consumes `colorize_params` —
+                //   nothing is baked, so any shape sprite carrying a fore/back
+                //   colour lost the key outright.
+                //
+                // Keying here instead is exact: `bg_color` is the same value the
+                // fills above were drawn with. Foreground pixels that happen to
+                // equal bgColor drop out too, which is what Background Transparent
+                // means. The shader key still runs and is now a no-op for these
+                // texels (they fail `src.a < 0.01` first).
+                //
+                // The ink set is every ink whose shader discards on
+                // `dist < u_color_tolerance` against `u_bg_color` (see shaders.rs):
+                //   2/4  Reverse, Not Copy      33/34  Add Pin, Add
+                //   3    Ghost                  35/38  Sub Pin, Subtract
+                //   6    Not Reverse            36     Background Transparent
+                //   40   Lighten
+                // Ink 7 (Not Ghost) is deliberately excluded — it is the INVERSE
+                // key, discarding everything that does NOT match bgColor, so
+                // baking these texels away would leave it drawing nothing. Ink 41
+                // (Darken) does not key at all (it is a fore/back duotone remap),
+                // and 8/9 (Matte, Mask) resolve transparency by their own paths.
+                if matches!(ink, 2 | 3 | 4 | 6 | 33 | 34 | 35 | 36 | 38 | 40) {
+                    let (kr, kg, kb) = bg_color;
+                    for px in shape_bitmap.data.chunks_exact_mut(4) {
+                        if px[3] != 0 && px[0] == kr && px[1] == kg && px[2] == kb {
+                            px[3] = 0;
+                        }
+                    }
+                }
+
+                let texture = match self.context.create_texture() {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                if self.context.upload_texture_rgba(&texture, width, height, &shape_bitmap.data).is_err() {
+                    return;
+                }
+                texture
+            }
+            TextureSource::VectorShapeBitmap {
+                width, height, vector_member,
+            } => {
+                let w = width as i32;
+                let h = height as i32;
+
+                let mut shape_bitmap = Bitmap::new(
+                    width as u16, height as u16, 32, 32, 8,
+                    PaletteRef::BuiltIn(get_system_default_palette()),
+                );
+                shape_bitmap.use_alpha = true;
+                shape_bitmap.data.fill(0);
+
+                let palettes = player.movie.cast_manager.palettes();
+                let dst_rect = IntRect::from(0, 0, w, h);
+                shape_bitmap.draw_vector_shape(&vector_member, dst_rect, &palettes, 1.0);
+
+                // Ink:36 + has_fore_color: multiply each visible pixel's
+                // RGB by sprite.color / 255. CS private-studio
+                // `floor_shape_a` uses ink:36 with sprite.color set to
+                // `aColorData.texturecolor` (e.g. yellow rgb(255, 255, 0))
+                // — Director ties the floor's wood/brown look to this
+                // multiplicative tint of the pink gradient. The vector
+                // shape bypasses bitmap_to_rgba, so we apply the tint
+                // here before upload. Skip alpha=0 pixels so the matte
+                // (transparent black backdrop) stays transparent.
+                if ink == 36 && has_fore_color {
+                    let fr = fg_color_rgb.0;
+                    let fg2 = fg_color_rgb.1;
+                    let fb = fg_color_rgb.2;
+                    let pixels = shape_bitmap.data.len() / 4;
+                    for i in 0..pixels {
+                        let idx = i * 4;
+                        if shape_bitmap.data[idx + 3] == 0 {
+                            continue;
+                        }
+                        shape_bitmap.data[idx]     = ((shape_bitmap.data[idx]     as u16 * fr as u16) / 255) as u8;
+                        shape_bitmap.data[idx + 1] = ((shape_bitmap.data[idx + 1] as u16 * fg2 as u16) / 255) as u8;
+                        shape_bitmap.data[idx + 2] = ((shape_bitmap.data[idx + 2] as u16 * fb as u16) / 255) as u8;
+                    }
+                }
+
+                let texture = match self.context.create_texture() {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                if self.context.upload_texture_rgba(&texture, width, height, &shape_bitmap.data).is_err() {
+                    return;
+                }
+                texture
+            }
+            TextureSource::Shockwave3dScene { width, height, passes } => {
+                // Draw each camera pass in order (lowest index first, higher on top),
+                // every one against the member that owns its camera. Camera backdrops
+                // (Director `addBackdrop`) are drawn inside render_scene_with_state_ex,
+                // after its clear and before the models — see draw_backdrops_inline.
+                //
+                // The first pass always clears the FBO; later ones honour their own
+                // camera's `colorBuffer.clearAtRender`, which is how a movie layers a
+                // skybox, the 3D world and an orthographic UI pass into one sprite.
+                let member_key = passes.first().map(|p| p.member_key).unwrap_or((0, 0));
+                for (i, pass) in passes.iter().enumerate() {
+                    let clear = if i == 0 {
+                        true
+                    } else {
+                        pass.camera.as_ref()
+                            .and_then(|c| pass.runtime_state
+                                .camera_clear_at_render
+                                .get(c)
+                                .copied())
+                            .unwrap_or(true)
+                    };
+                    self.scene3d.active_camera = pass.camera.clone();
+                    if let Err(e) = self.scene3d.render_scene_with_state_ex(
+                        &self.context, pass.member_key, &pass.scene, width, height,
+                        Some(&pass.runtime_state), clear,
+                    ) {
+                        // One bad pass must not abandon the whole sprite — the other
+                        // cameras (including the one showing the actual world) still
+                        // need to draw.
+                        crate::console_error!(
+                            "[3D] Render failed for member {:?} camera {:?}: {:?}",
+                            pass.member_key, pass.camera, e
+                        );
+                        continue;
+                    }
+                }
+
+
+                // Render overlays on top of everything
+                for pass in &passes {
+                    for (_, overlays) in &pass.runtime_state.camera_overlays {
+                        if !overlays.is_empty() {
+                            self.scene3d.render_overlays_to_fbo(
+                                &self.context, &pass.member_key, overlays, width, height,
+                            );
+                        }
+                    }
+                }
+
+                // Get the final FBO texture
+                let fbo_tex = match self.scene3d.fbo_texture.as_ref() {
+                    Some(tex) => tex.clone(),
+                    None => {
+                        warn!("[3D] No FBO texture for member {:?}", member_key);
+                        return;
+                    }
+                };
+
+                // "3D has rendered" — drives the pointer-lock heuristic, which used
+                // to infer this from `w3d_frame_buffers` being non-empty.
+                player.w3d_any_rendered = true;
+
+                // Capture FBO pixels for world.image access — ONLY if a script has
+                // actually asked for this member's image. The readback is a
+                // synchronous GPU->CPU stall (22.9% of frame time in a profile of a
+                // 3D-heavy movie) plus two full-size allocations, and it ran every
+                // frame for every 3D member on the chance someone might read
+                // `world.image`. The getter's offscreen render covers the first
+                // request, so nothing is served stale.
+                if player.w3d_image_requested.contains(&member_key) {
+                    self.capture_w3d_frame(player, member_key, width, height);
+                }
+
+                // Unbind FBO so 2D compositor draws to the canvas, not the FBO
+                self.context.gl().bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+
+                // The 3D renderer changed the active GL program and VAO —
+                // restore 2D state so subsequent sprite draws work correctly
+                self.shader_manager.clear_active();
+                // Re-bind the 2D quad VAO (the 3D renderer unbound it)
+                self.quad.bind(self.context.gl());
+                // Restore viewport to full canvas size (3D renderer changed it to FBO size)
+                let canvas = self.context.gl().canvas().unwrap();
+                let canvas_el: web_sys::HtmlCanvasElement = canvas.dyn_into().unwrap();
+                self.context.gl().viewport(0, 0, canvas_el.width() as i32, canvas_el.height() as i32);
+
+                fbo_tex
+            }
+        };
+
+        // Select shader based on ink mode
+        // For rendered text with ink 36: the text bitmap already has alpha=0 for background
+        // and alpha>0 for text pixels (bg fill is suppressed for ink 36). Use Copy (alpha
+        // blending) so the shader doesn't color-key text pixels that match bgColor.
+        // For indexed ink 36 bitmaps: transparency is baked into texture alpha,
+        // so use Copy shader (whose discard works reliably) instead of BackgroundTransparent
+        let is_ink36_indexed_baked = ink == 36 && bitmap_bit_depth >= 2 && bitmap_bit_depth <= 8;
+        // For 32-bit bitmaps with use_alpha and ink 36: transparency is baked into texture
+        // alpha by bitmap_to_rgba (bgColor pixels → alpha=0). Use Copy shader to avoid
+        // the BackgroundTransparent shader's color-key discard which would incorrectly
+        // hide content pixels that match bgColor.
+        let is_ink36_alpha_baked = ink == 36 && bitmap_bit_depth == 32 && bitmap_use_alpha;
+        let text_needs_alpha = is_rendered_text && (ink == 36 || ink == 2 || bg_color_rgb == (255, 255, 255));
+        let ink_mode = if text_needs_alpha {
+            InkMode::Copy
+        } else if is_button_alpha_matte {
+            InkMode::Copy
+        } else if is_ink36_indexed_baked || is_ink36_alpha_baked {
+            // Transparency baked into texture — use Copy shader for reliable discard
+            InkMode::Copy
+        } else if ink == 9 {
+            // Ink 9 (Mask): alpha baked from mask bitmap into texture — use Copy shader
+            InkMode::Copy
+        } else {
+            InkMode::from_ink_number(ink)
+        };
+        // use_program returns the effective ink mode (after fallback if needed)
+        let effective_ink = self.shader_manager.use_program(&self.context, ink_mode);
+
+        // Get the active program's uniform locations (use effective_ink to ensure consistency)
+        let program = match self.shader_manager.get_program(effective_ink) {
+            Some(p) => p,
+            None => return,
+        };
+        let u_projection = program.u_projection.clone();
+        let u_texture = program.u_texture.clone();
+        let u_sprite_rect = program.u_sprite_rect.clone();
+        let u_tex_rect = program.u_tex_rect.clone();
+        let u_flip = program.u_flip.clone();
+        let u_rotation = program.u_rotation.clone();
+        let u_rotation_center = program.u_rotation_center.clone();
+        let u_blend = program.u_blend.clone();
+        let u_fg_color = program.u_fg_color.clone();
+        let u_bg_color = program.u_bg_color.clone();
+        let u_color_tolerance = program.u_color_tolerance.clone();
+
+        // Set blend mode based on effective ink (to match the shader being used)
+        match effective_ink {
+            InkMode::AddPin => {
+                self.context.set_blend_additive();
+            }
+            InkMode::SubPin => {
+                // SubPin uses reverse subtract: result = dst - src
+                self.context.set_blend_subtractive();
+            }
+            InkMode::Darken => {
+                // Darken uses standard alpha blending
+                // The shader multiplies src by bgColor, then we alpha-blend the result
+                self.context.set_blend_alpha();
+            }
+            InkMode::Light => {
+                // Light (ink 37): MAX(src, dst) per channel
+                self.context.set_blend_lighten();
+            }
+            InkMode::Dark => {
+                // Dark (ink 39): MIN(src, dst) per channel
+                self.context.set_blend_darken();
+            }
+            InkMode::Lighten => {
+                // Lighten in Director: skip bgColor pixels, blend others normally
+                // This is NOT max(src, dst) - it's just normal alpha blending
+                // with transparency for bgColor pixels (baked into texture alpha)
+                self.context.set_blend_alpha();
+            }
+            _ => self.context.set_blend_alpha(),
+        }
+
+        // Now we can get gl reference and set uniforms
+        let gl = self.context.gl();
+
+        // Set projection matrix
+        if let Some(ref loc) = u_projection {
+            gl.uniform_matrix4fv_with_f32_array(Some(loc), false, &self.projection_matrix);
+        }
+
+        // Bind texture
+        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&tex));
+        if let Some(ref loc) = u_texture {
+            gl.uniform1i(Some(loc), 0);
+        }
+
+        // Director area-averages a bitmap it shrinks; point-sampling a big
+        // dithered 8-bit source into a small sprite rect samples isolated dither
+        // pixels and destroys the tone (NabiscoWorld Mini-Golf's 624x350 hole art
+        // in a 111x71 menu card read as washed out next to Shockwave Player).
+        // Only switch to mipmapped minification once the sprite is meaningfully
+        // smaller than its source; at or above native size MAG_FILTER (NEAREST)
+        // applies and every other movie stays pixel-exact.
+        //
+        // NOT for a colour-keyed ink, whatever the ratio: those shaders decide a
+        // pixel from its exact colour, and a filtered sample invents colours the
+        // source never had along every key boundary. Habbo v7's room lights are
+        // a black glow on a keyed white field at ink 33 — the Dirty Duck's
+        // `pub_light_02` (292x292 into 408x186, 1.57x) and the lobby's
+        // `lobby_coloredlight_1` (186x186 into 296x141, 1.32x) both cleared the
+        // threshold, so the averaged white-to-dark edge missed the key and went
+        // through the additive blend as a bright ring around the light.
+        let minifies = !effective_ink.keys_on_bg_color()
+            && tex_source_size.map_or(false, |(sw, sh)| {
+                let (dw, dh) = (sprite_rect.width() as f32, sprite_rect.height() as f32);
+                dw > 0.0 && dh > 0.0 && (sw as f32 / dw > 1.2 || sh as f32 / dh > 1.2)
+            });
+        gl.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_MIN_FILTER,
+            if minifies {
+                WebGl2RenderingContext::LINEAR_MIPMAP_LINEAR as i32
+            } else {
+                WebGl2RenderingContext::NEAREST as i32
+            },
+        );
+
+        // Set sprite rect uniform (x, y, width, height)
+        if let Some(ref loc) = u_sprite_rect {
+            gl.uniform4f(
+                Some(loc),
+                sprite_rect.left as f32,
+                sprite_rect.top as f32,
+                sprite_rect.width() as f32,
+                sprite_rect.height() as f32,
+            );
+        }
+
+        // Set texture rect (full texture for now)
+        if let Some(ref loc) = u_tex_rect {
+            gl.uniform4f(Some(loc), 0.0, 0.0, 1.0, 1.0);
+        }
+
+        // Handle skew
+        // rotation=180 alone: (x,y) -> (-x,-y) = upside down
+        // rotation=180 + skew=180: (x,-y) -> (-x,y) = left-right mirror
+        let has_skew_flip = is_skew_flip(skew);
+
+        // Set flip (texture coordinates only, for sprite.flip_h and sprite.flip_v)
+        if let Some(ref loc) = u_flip {
+            gl.uniform2f(
+                Some(loc),
+                if flip_h { 1.0 } else { 0.0 },
+                if flip_v { 1.0 } else { 0.0 },
+            );
+        }
+
+        // Set skew flip (vertex space y-negation before rotation)
+        if let Some(ref loc) = program.u_skew_flip {
+            gl.uniform1f(Some(loc), if has_skew_flip { 1.0 } else { 0.0 });
+        }
+        if let Some(ref loc) = program.u_floor_rule {
+            gl.uniform1f(Some(loc), if floor_rule { 1.0 } else { 0.0 });
+        }
+
+        // Continuous skew (`the skew of sprite`) — applied as a horizontal
+        // shear `x += y * tan(skew_radians)` around the registration point,
+        // before rotation. Suppressed when has_skew_flip is true so the
+        // special ±180° vertical-flip path (handled by u_skew_flip above)
+        // isn't doubled up — note that tan(180°) = 0 wouldn't actually
+        // shear, but the mode-switch keeps intent explicit.
+        if let Some(ref loc) = program.u_skew {
+            let skew_rad = if has_skew_flip {
+                0.0_f32
+            } else {
+                (skew as f32).to_radians()
+            };
+            gl.uniform1f(Some(loc), skew_rad);
+        }
+
+        // Set rotation (convert degrees to radians)
+        // Note: drawing.rs negates for inverse rotation (dst->src mapping),
+        // but WebGL does forward rotation (vertex transformation), so no negation needed
+        if let Some(ref loc) = u_rotation {
+            gl.uniform1f(Some(loc), (rotation as f32).to_radians());
+        }
+
+        // Set rotation center (sprite's registration point: loc_h, loc_v)
+        if let Some(ref loc) = u_rotation_center {
+            gl.uniform2f(Some(loc), raw_loc.0 as f32, raw_loc.1 as f32);
+        }
+
+        // Set blend (0-100 -> 0.0-1.0)
+        if let Some(ref loc) = u_blend {
+            gl.uniform1f(Some(loc), blend as f32 / 100.0);
+        }
+
+        // Set background color for ink modes that need it:
+        // - BackgroundTransparent: for color-key transparency
+        // - NotGhost: for color-key transparency
+        // - Darken: for src * bg_color multiplication
+        // - AddPin: for color-key transparency (ALL bgColor pixels transparent)
+        // - SubPin: for color-key transparency (ALL bgColor pixels transparent)
+        // Note: Matte (ink 8) uses flood-fill matte in texture alpha, not color-key
+        // (using the already-resolved bg_color_rgb from earlier)
+        // (`keys_on_bg_color` is the same set, shared with the sampling choice
+        // above so the two cannot drift apart.)
+        if effective_ink.keys_on_bg_color() {
+            if let Some(ref loc) = u_bg_color {
+                gl.uniform4f(
+                    Some(loc),
+                    bg_color_rgb.0 as f32 / 255.0,
+                    bg_color_rgb.1 as f32 / 255.0,
+                    bg_color_rgb.2 as f32 / 255.0,
+                    1.0,
+                );
+            }
+            if let Some(ref loc) = u_color_tolerance {
+                // For 1-bit bitmaps: transparency is baked into texture alpha via is_1bit_transparent
+                // For indexed ink 40 (2-8 bit): transparency is baked via RGB comparison with sprite's bgColor
+                // In both cases, disable shader color-key by setting tolerance to 0.
+                // For 16-bit and 32-bit: use small tolerance for floating-point RGB comparison.
+                let is_indexed_ink40 = bitmap_bit_depth >= 2 && bitmap_bit_depth <= 8 && (ink == 37 || ink == 39 || ink == 40);
+                // Colorize is baked INTO the texture, so the texel no longer
+                // holds the source colour the key was meant to test — and the
+                // key was already applied, against the original pixels, when
+                // that alpha was baked (`bitmap_to_rgba` computes alpha from
+                // `(r, g, b)` before colorizing). Running it again on the
+                // colorized texel double-keys: any pixel the tint happens to
+                // land ON the key colour gets discarded.
+                //
+                // Merlin's Revenge 3 hits this with its white HUD counters —
+                // `objDisplayCounter` defaults to `i[#colour] = rgb(255,255,255)`
+                // and the pooled sprites carry bgColor white, so every glyph
+                // colorized to white matched the key and vanished. The coloured
+                // potion counters were unaffected (red is not white), which is
+                // why only the white ones stayed missing.
+                //
+                // 1-bit and indexed ink 37/39/40 already disable the key for
+                // exactly this reason: their transparency is baked too.
+                let colorize_baked =
+                    matches!(colorize_params, Some((has_f, has_b, ..)) if has_f || has_b);
+                // 16-bit bitmaps need higher tolerance due to RGB565 quantization:
+                // max error is ~4/255 ≈ 0.016, so use 0.02 to cover rounding
+                let tolerance = if bitmap_bit_depth == 1 || is_indexed_ink40 || colorize_baked {
+                    0.0
+                } else if bitmap_bit_depth == 16 {
+                    0.02
+                } else {
+                    0.01
+                };
+                gl.uniform1f(Some(loc), tolerance);
+            }
+        }
+
+        // Darken (ink 41) is a foreColor/bgColor duotone and Lighten (ink 40)
+        // adds the foreColor: feed the shader the sprite's foreColor as well
+        // as the bgColor set above. Lighten adds it to TRUE-COLOUR bitmaps
+        // only. An indexed bitmap under Lighten keeps its palette colours
+        // (Habbo's navigator buttons: 8-bit, ink 40, foreColor light grey, and
+        // the real client leaves their black outlines black), while a 32-bit
+        // one is lifted by the foreColor (Matematik i Maaneby's stones).
+        if effective_ink == InkMode::Darken || effective_ink == InkMode::Lighten {
+            let fg = if effective_ink == InkMode::Lighten && bitmap_bit_depth <= 8 {
+                (0, 0, 0)
+            } else {
+                fg_color_rgb
+            };
+            if let Some(ref loc) = u_fg_color {
+                gl.uniform4f(
+                    Some(loc),
+                    fg.0 as f32 / 255.0,
+                    fg.1 as f32 / 255.0,
+                    fg.2 as f32 / 255.0,
+                    1.0,
+                );
+            }
+        }
+
+        // Draw the quad
+        self.quad.draw(gl);
+
+        // Unbind texture
+        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+
+        // Free the per-frame dynamic texture now that the quad is drawn — it is
+        // not held by any cache (see `owns_dynamic_texture`). Without this, each
+        // frame leaks one GL texture per vector-shape/shape/button sprite.
+        if owns_dynamic_texture {
+            gl.delete_texture(Some(&tex));
+        }
+
+        // Reset blend equation if we used an ink that changes it from the default FUNC_ADD
+        if effective_ink == InkMode::SubPin || effective_ink == InkMode::Light || effective_ink == InkMode::Dark {
+            self.context.reset_blend_equation();
+        }
+    }
+
+    /// Convert bitmap data to RGBA format for GPU texture upload
+    ///
+    /// For bitmaps without explicit matte, computes a flood-fill matte mask from edges
+    /// using the bitmap's intrinsic background color (palette index 0 for indexed bitmaps,
+    /// white for 32-bit). This matches Director's behavior where the matte is computed
+    /// once per bitmap based on its own palette, not the sprite's bgColor.
+    ///
+    /// For indexed bitmaps, we compare palette INDICES (not RGB values) to match
+    /// how Canvas2D's create_matte works. This ensures that only pixels with exactly
+    /// palette index 0 are considered background, not pixels that happen to have the
+    /// same RGB color at a different palette index.
+    ///
+    /// Colorize parameters: (has_fore, has_back, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b)
+    /// sprite_bg_color: The sprite's bgColor, used for ink 8 matte computation on indexed bitmaps
+    /// mask_bitmap: For ink 9 (Mask), the next cast member's bitmap used as grayscale alpha mask
+    /// mask_offset: For ink 9, `mask_reg_point - source_reg_point` — Director aligns
+    /// the mask to the source by registration point, not by origin, and the two
+    /// bitmaps are often different sizes
+    /// is_flash_bitmap: True when this bitmap is a Ruffle captureFrame buffer
+    /// (sourced from a Flash sprite via wmode='transparent'). Such bitmaps
+    /// have their transparency authoritatively encoded in the alpha channel;
+    /// secondary ink-36-style color-keying against sprite.bg_color would
+    /// destructively strip artwork whose fill happens to equal the bg.
+    /// Plain authored 32-bit bitmaps with embedded alpha (PNG imports) still
+    /// need the color-key to make ink 36 actually do its job.
+    pub(crate) fn bitmap_to_rgba(
+        bitmap: &Bitmap,
+        palettes: &crate::player::bitmap::palette_map::PaletteMap,
+        ink: i32,
+        colorize: Option<(bool, bool, u8, u8, u8, u8, u8, u8)>,
+        sprite_bg_color: Option<(u8, u8, u8)>,
+        mask_bitmap: Option<&Bitmap>,
+        mask_offset: (i32, i32),
+        is_flash_bitmap: bool,
+    ) -> Vec<u8> {
+        let width = bitmap.width as usize;
+        let height = bitmap.height as usize;
+        let mut rgba_data = Vec::with_capacity(width * height * 4);
+
+        // Extract colorize info if present
+        let (has_fore, has_back, fg_rgb, bg_rgb) = match colorize {
+            Some((has_f, has_b, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b)) => {
+                (has_f, has_b, (fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b))
+            }
+            None => (false, false, (0, 0, 0), (255, 255, 255)),
+        };
+
+        // Check if colorize should be applied
+        // Matches drawing.rs allows_colorize() function (lines 750-762)
+        // EXCEPTION: ink 36 indexed has special foreColor tinting (drawing.rs lines 1188-1196)
+        //   For ink 36 indexed, foreColor is ALWAYS applied to foreground pixels (index 255 or black),
+        //   regardless of has_fore_color flag - this is Director behavior.
+        // Note: Ink 40 does NOT use colorization - it only uses color-key transparency
+        let allow_colorize = match (bitmap.original_bit_depth, ink as u32) {
+            // 1-bit: EVERY ink. A 1-bit image stores coverage, not colour, so
+            // its two indices only mean something once fore/bgColor are
+            // substituted in. drawing.rs doesn't list this because its 1-bit
+            // case is handled in a separate branch that runs BEFORE
+            // `allows_colorize` and applies foreColor unconditionally; WebGL2
+            // has no such branch, so the permission has to be granted here or
+            // the two renderers disagree.
+            //
+            // Merlin's Revenge's spell blast is 1-bit artwork drawn with ink 1
+            // (Transparent) and sprite.color rgb(245,195,5). Without this the
+            // colorize params were built and then discarded at the apply site,
+            // the raw indices reached the shader, and systemWin maps index 255
+            // to black — a correctly shaped, entirely black blast.
+            (1, _) => true,
+            (32, 0) => true,                    // 32-bit ink 0: grayscale remap
+            (32, 8) | (32, 9) => true,          // 32-bit ink 8/9: foreColor only
+            (32, 36) => true,                   // 32-bit ink 36: foreColor MULTIPLICATIVE tint
+            (d, 0) if d <= 8 => true,           // indexed ink 0: palette index interpolation
+            (d, 8) | (d, 9) if d <= 8 => true,  // indexed ink 8/9: foreColor only
+            (d, 36) if d <= 8 => true,          // indexed ink 36: foreColor tinting for index 255/black (ALWAYS)
+            _ => false,
+        };
+
+        // Special flag for ink 36 indexed foreColor tinting
+        // Only tint when foreColor was explicitly set (has_fore from colorize params)
+        let ink36_indexed_tint = bitmap.original_bit_depth <= 8 && ink == 36 && has_fore;
+
+        // Check if backColor should be used (for fg→bg interpolation
+        // through the bitmap's near-grayscale palette). Director's
+        // private-studio walls use ink:8 (Matte) with `sprite.color`
+        // (red) + `sprite.bgColor` (darker red) on indexed pattern
+        // bitmaps; the expected behavior is the same fg→bg lerp ink:0
+        // does. Without ink:8/9 listed here, the lerp branch was gated
+        // off and only palette-index-0 pixels got tinted with foreColor —
+        // which left the bulk of the wall pattern rendering as its
+        // native gray indices.
+        let use_back_color = match (bitmap.original_bit_depth, ink as u32) {
+            (32, 0) => true,
+            (d, 0) if d <= 8 => true,
+            (d, 8) | (d, 9) if d <= 8 => true,
+            _ => false,
+        };
+
+        // Compute flood-fill matte from edges for bitmaps without explicit matte.
+        //
+        // Director behavior for matte:
+        // - Ink 0 (Copy): use matte ONLY when trim_white_space is true
+        // - Ink 8 (Matte): ALWAYS use matte (this is the "matte" ink, its whole purpose is transparency)
+        //
+        // For ink 8, the pre-computed bitmap.matte should be used (created by rendering.rs).
+        // If bitmap.matte doesn't exist, we compute it here.
+        //
+        // Bit depth support:
+        // - Indexed bitmaps (depth <= 8): use matte for ink 0 (when trim_white_space) and ink 8 (always)
+        // - 16-bit bitmaps: use matte for ink 0 only (when trim_white_space)
+        // - 32-bit bitmaps with use_alpha=false: use flood-fill matte for ink 0/8
+        // - 32-bit bitmaps with use_alpha=true: use embedded alpha channel (no matte)
+        //
+        // IMPORTANT: Use original_bit_depth for these checks because bit_depth can change
+        // during execution (e.g., 4-bit stored as 8-bit), but original_bit_depth reliably
+        // indicates when palette colors should be applied.
+        let is_indexed = bitmap.original_bit_depth > 0 && bitmap.original_bit_depth <= 8;
+        let is_16bit = bitmap.original_bit_depth == 16;
+        let is_32bit = bitmap.original_bit_depth == 32;
+
+        let is_grayscale = matches!(&bitmap.palette_ref, crate::player::bitmap::bitmap::PaletteRef::BuiltIn(
+            crate::player::bitmap::bitmap::BuiltInPalette::GrayScale
+        ));
+
+        // Determine when to use matte based on ink mode:
+        //
+        // Matte mask usage for indexed bitmaps in score sprite rendering:
+        // - Ink 0: matte when trim_white_space is true
+        // - Ink 7 (Not Ghost): use matte for indexed bitmaps (flood-fill, not color-key)
+        // - Ink 8 (Matte): ALWAYS use matte (flood-fill transparency)
+        // - Ink 9 (Mask): use matte for 32-bit bitmaps (embedded alpha or grayscale-as-alpha)
+        // - Ink 41 (Darken): use matte for indexed and 32-bit bitmaps
+        //
+        // Important: some inks use color-key transparency in the shader instead of matte:
+        // - Ink 33 (Add Pin): color-key comparison in shader
+        // - Ink 36 (BgTransparent): color-key comparison in shader
+        let should_use_matte_ink0 = ink == 0 && bitmap.trim_white_space;
+        // Ink 7 (Not Ghost) uses matte for indexed and 16-bit bitmaps (flood-fill from edges)
+        // This matches Canvas2D's should_matte_sprite which includes ink 7
+        let should_use_matte_ink7 = ink == 7 && (is_indexed || is_16bit);
+        // Ink 8 (Matte) ALWAYS uses matte for indexed, 16-bit, and 32-bit bitmaps in score rendering
+        // The flood-fill matte makes edge-connected background pixels transparent
+        // while keeping interior pixels (even if same color) opaque
+        // For 32-bit, only applies when use_alpha is false (otherwise embedded alpha is used)
+        let should_use_matte_ink8 = ink == 8 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 9 (Mask) uses matte for 32-bit bitmaps (embedded alpha like ink 8)
+        let should_use_matte_ink9 = ink == 9 && (is_32bit && !bitmap.use_alpha);
+        // Ink 41 (Darken) uses matte for indexed, 16-bit, and 32-bit bitmaps
+        // Background pixels should be transparent so they don't darken the destination
+        // For indexed: use palette index 0
+        // For 16-bit/32-bit: use RGB comparison with bgColor (typically white)
+        let should_use_matte_ink41 = ink == 41 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 32 (Blend) applies blend percentage with matte-based background transparency
+        // Without matte, the white background would be visible at the blend percentage
+        let should_use_matte_ink32 = ink == 32 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 33 (Add Pin) uses COLOR-KEY transparency (ALL bgColor pixels transparent)
+        // NOT flood-fill matte. See drawing.rs lines 160-163: if src == bg_color { dst }
+        // Color-key comparison is handled in the shader, not texture matte.
+        // For 16-bit and 32-bit, the shader compares pixel RGB with bgColor uniform.
+        // Ink 3 (Ghost) uses COLOR-KEY transparency (ALL bgColor pixels transparent)
+        // Ghost ink makes background transparent and inverts foreground colors
+        let should_use_colorkey_ink3 = ink == 3 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        let should_use_colorkey_ink33 = ink == 33 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 35 (Sub Pin) uses COLOR-KEY transparency (ALL bgColor pixels transparent)
+        // Same behavior as ink 33 but with subtractive blending
+        let should_use_colorkey_ink35 = ink == 35 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 36 uses color-key transparency for indexed (2-8 bit), 16-bit, and 32-bit bitmaps (not flood-fill)
+        // EXCEPTION: 1-bit bitmaps already have alpha baked into texture via is_1bit_transparent,
+        // so they don't need shader color-key (which would incorrectly discard colorized pixels)
+        // See drawing.rs lines 1210-1231 for 16-bit ink 36 handling
+        // See drawing.rs lines 1421-1437 for 32-bit ink 36 handling
+        let is_indexed_not_1bit = bitmap.original_bit_depth >= 2 && bitmap.original_bit_depth <= 8;
+        let should_use_colorkey_ink36 = ink == 36 && (is_indexed_not_1bit || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 37 (Light) uses color-key transparency: skip bgColor pixels
+        // For indexed bitmaps: bake transparency based on palette index
+        // For 16-bit and 32-bit: use RGB color-key in shader
+        let should_use_colorkey_ink37 = ink == 37 && (is_indexed_not_1bit || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 39 (Dark) uses color-key transparency: skip bgColor pixels
+        let should_use_colorkey_ink39 = ink == 39 && (is_indexed_not_1bit || is_16bit || (is_32bit && !bitmap.use_alpha));
+        // Ink 40 (Lighten) uses color-key transparency: skip bgColor pixels
+        // For indexed bitmaps: use palette index comparison in texture (baked alpha)
+        // For 16-bit and 32-bit: use RGB color-key in shader
+        let should_use_colorkey_ink40 = ink == 40 && (is_16bit || (is_32bit && !bitmap.use_alpha));
+        // For indexed ink 40, we bake transparency based on palette index
+        let is_ink40_indexed_transparent = ink == 40 && is_indexed_not_1bit;
+        // For indexed ink 37/39, bake transparency based on palette index
+        let is_ink37_indexed_transparent = ink == 37 && is_indexed_not_1bit;
+        let is_ink39_indexed_transparent = ink == 39 && is_indexed_not_1bit;
+        // Total: when to use matte (either pre-computed or on-the-fly)
+        // Note: ink 33 uses color-key in shader, NOT matte
+        let should_use_matte = should_use_matte_ink0 || should_use_matte_ink7 || should_use_matte_ink8 || should_use_matte_ink9 || should_use_matte_ink32 || should_use_matte_ink41;
+
+        // For ink 7, 8, 9, and 41, ALWAYS compute matte (flood-fill from edges)
+        // This matches score rendering behavior where these inks use matte
+        // The matte makes edge-connected background transparent while keeping interior pixels opaque
+        //
+        // Note: Ink 33 does NOT use flood-fill matte - it uses shader color-key
+        let ink_7_needs_matte = ink == 7 && (is_indexed || is_16bit);
+        let ink_8_needs_matte = ink == 8 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        let ink_9_needs_matte = ink == 9 && (is_32bit && !bitmap.use_alpha);
+        let ink_41_needs_matte = ink == 41 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+        let ink_32_needs_matte = ink == 32 && (is_indexed || is_16bit || (is_32bit && !bitmap.use_alpha));
+
+        let needs_computed_matte = (bitmap.matte.is_none() || ink_7_needs_matte || ink_8_needs_matte || ink_9_needs_matte || ink_32_needs_matte || ink_41_needs_matte)
+            && should_use_matte
+            && width > 0
+            && height > 0
+            && (
+                // Indexed bitmaps ink 7: ALWAYS use matte (flood-fill, not color-key)
+                (is_indexed && ink == 7)
+                // Indexed bitmaps ink 8: ALWAYS use matte (flood-fill transparency)
+                || (is_indexed && ink == 8)
+                // Indexed bitmaps ink 32: ALWAYS use matte (blend shouldn't show bg)
+                || (is_indexed && ink == 32)
+                // Indexed bitmaps ink 41: ALWAYS use matte (background shouldn't darken)
+                || (is_indexed && ink == 41)
+                // 16-bit bitmaps ink 7: ALWAYS use matte (flood-fill, not color-key)
+                || (is_16bit && ink == 7)
+                // 16-bit bitmaps ink 8: ALWAYS use matte (flood-fill transparency)
+                || (is_16bit && ink == 8)
+                // 16-bit bitmaps ink 41: ALWAYS use matte (background shouldn't darken)
+                || (is_16bit && ink == 41)
+                // 32-bit bitmaps: no matte for ink 0 (Director doesn't use matte on 32-bit ink 0)
+                // 32-bit bitmaps WITHOUT use_alpha ink 8: ALWAYS use matte (flood-fill transparency)
+                || (is_32bit && !bitmap.use_alpha && ink == 8)
+                // 32-bit bitmaps WITHOUT use_alpha ink 9: ALWAYS use matte (embedded alpha)
+                || (is_32bit && !bitmap.use_alpha && ink == 9)
+                // 32-bit bitmaps WITHOUT use_alpha ink 41: ALWAYS use matte with bgColor
+                || (is_32bit && !bitmap.use_alpha && ink == 41)
+            );
+
+        // Compute matte mask
+        let computed_matte: Option<Vec<bool>> = if needs_computed_matte {
+            if is_indexed {
+                // For indexed bitmaps:
+                // - Ink 7 (Not Ghost): use RGB comparison with sprite's bgColor
+                //   This ink makes edge-connected bgColor pixels transparent (skips bgColor pixels)
+                // - Ink 8 (Matte): use RGB comparison with sprite's bgColor
+                //   This ink makes edge-connected bgColor pixels transparent via flood-fill
+                // - Ink 41 (Darken): use palette index 0 comparison (standard matte)
+                //   The bgColor is used for color multiplication in the shader, not for matte
+                // - Other inks: use palette index 0 comparison (like bitmap.matte / create_matte())
+                //   This matches Director's standard behavior where index 0 is background.
+                // Note: Ink 33 uses shader color-key, NOT flood-fill matte
+                if ink == 7 {
+                    // Ink 7 (Not Ghost): use RGB comparison with sprite's bgColor
+                    let bg_color_for_matte = sprite_bg_color.unwrap_or_else(|| {
+                        bitmap.get_pixel_color(palettes, 0, 0)
+                    });
+
+                    Some(Self::compute_edge_matte_mask_rgb(bitmap, palettes, bg_color_for_matte, width, height))
+                } else {
+                    // Ink 8 (Matte), Ink 41, and others: use palette index 0 as background.
+                    // This matches Canvas2D's create_matte() which uses get_bg_color_ref() = PaletteIndex(0).
+                    // For custom palettes, palette index 0 is the transparent/background color —
+                    // using sprite_bg_color (RGB) here would fail to match for non-default palettes.
+                    Some(Self::compute_edge_matte_mask_indexed(bitmap, width, height))
+                }
+            } else if is_32bit {
+                // For 32-bit bitmaps without use_alpha:
+                // - Ink 8: use sprite's bgColor for matte (matches Canvas2D behavior)
+                // - Ink 9: use sprite's bgColor for matte
+                // - Ink 41 (Darken): use bitmap's structural bg (white). Canvas2D's
+                //   create_matte uses get_bg_color_ref() = Rgb(255,255,255) for non-palette
+                //   bitmaps; the sprite's bgColor only tints the multiplication in the shader.
+                //   Using sprite_bg_color here would re-flood the matte every time bgColor
+                //   changes, causing real bg pixels to render as colored blobs.
+                // - Other inks: use edge color
+                let bg_color_for_matte = if ink == 8 || ink == 9 {
+                    sprite_bg_color.unwrap_or_else(|| bitmap.get_pixel_color(palettes, 0, 0))
+                } else if ink == 41 {
+                    (255u8, 255u8, 255u8)
+                } else {
+                    bitmap.get_pixel_color(palettes, 0, 0)
+                };
+                Some(Self::compute_edge_matte_mask_rgb(bitmap, palettes, bg_color_for_matte, width, height))
+            } else if is_16bit {
+                // For 16-bit bitmaps:
+                // - Ink 7, 8: use sprite's bgColor for matte (matches Canvas2D behavior)
+                // - Ink 41 (Darken): use bitmap's structural bg (white) — see 32-bit branch above
+                // - Ink 0: use white as background (default for trim_white_space)
+                let bg_color_for_matte = if ink == 7 || ink == 8 {
+                    sprite_bg_color.unwrap_or((255u8, 255u8, 255u8))
+                } else {
+                    (255u8, 255u8, 255u8)
+                };
+                Some(Self::compute_edge_matte_mask_rgb(bitmap, palettes, bg_color_for_matte, width, height))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // FAST PATH — a plain Copy (ink 0) bitmap with no colorize / matte /
+        // mask / flash processing maps 1:1 to its pixels; ink-0 alpha is either
+        // the embedded byte (32-bit use_alpha) or a constant 255 (line ~4441).
+        // The general loop calls `get_pixel_color` + runs the ink branch-soup
+        // PER PIXEL — ~15ms for a 1000×1000 map / water viewport re-uploaded
+        // every frame (g349 scrolling). Convert in a tight loop instead;
+        // bit-identical output.
+        let colorize_active = matches!(colorize, Some((f, b, ..)) if f || b);
+        // Ink 36 (BgTransparent) on an indexed bitmap bakes its alpha as a plain
+        // per-pixel color-key: `(rgb == sprite_bg) ? 0 : 255` (line ~4529). Ink 0
+        // is fully opaque. Both are just a palette lookup + a trivial alpha rule
+        // — no matte/mask/colorize/flash — so a tight loop replaces the per-pixel
+        // `get_pixel_color` + branch soup that cost ~15ms for the map and ~4ms
+        // for each ink-36 tile every frame.
+        // ink 36's alpha handling differs for Flash captures (`is_flash_bitmap`
+        // skips the bgColor color-key, line ~4516), so only fast-path ink 36 for
+        // non-flash. ink 0 is identical either way (embedded alpha / 255), so it
+        // fast-paths regardless — this is what covers the game's large Flash
+        // captures (member 1:1 1000x1000, 1:13 1190x575) that cost ~21/10ms each.
+        let ink36_indexed_key = ink == 36 && !is_flash_bitmap
+            && bitmap.original_bit_depth >= 2 && bitmap.original_bit_depth <= 8;
+        if (ink == 0 || ink36_indexed_key)
+            && !colorize_active
+            && mask_bitmap.is_none()
+            && !should_use_matte
+            && computed_matte.is_none()
+        {
+            // 32-bit ink 0: RGBA bytes are already the output.
+            if ink == 0 && bitmap.bit_depth == 32 && bitmap.data.len() == width * height * 4 {
+                if bitmap.use_alpha {
+                    return bitmap.data.clone();
+                }
+                let mut out = bitmap.data.clone();
+                let mut i = 3;
+                while i < out.len() {
+                    out[i] = 255;
+                    i += 4;
+                }
+                return out;
+            }
+            // 8-bit indexed (ink 0 opaque, or ink 36 bg-color-keyed): pre-resolve
+            // the 256-entry palette once, then a tight index→RGBA loop.
+            if bitmap.bit_depth == 8 && bitmap.data.len() == width * height {
+                let mut pal = [(0u8, 0u8, 0u8); 256];
+                for (i, slot) in pal.iter_mut().enumerate() {
+                    *slot = resolve_color_ref(
+                        palettes,
+                        &ColorRef::PaletteIndex(i as u8),
+                        &bitmap.palette_ref,
+                        bitmap.original_bit_depth,
+                    );
+                }
+                let bg = sprite_bg_color.unwrap_or((255, 255, 255));
+                let mut out = vec![0u8; width * height * 4];
+                for (p, &idx) in bitmap.data.iter().enumerate() {
+                    let (r, g, b) = pal[idx as usize];
+                    let a = if ink36_indexed_key && (r, g, b) == bg { 0 } else { 255 };
+                    let o = p * 4;
+                    out[o] = r;
+                    out[o + 1] = g;
+                    out[o + 2] = b;
+                    out[o + 3] = a;
+                }
+                return out;
+            }
+        }
+
+        let mut opaque_count = 0usize;
+        let mut transparent_count = 0usize;
+
+        // Check if this is a 32-bit bitmap with embedded alpha (use_alpha=true)
+        // These should use embedded alpha, ignoring any matte that may have been computed
+        // Use original_bit_depth since bit_depth can change during execution
+        let use_embedded_alpha = bitmap.original_bit_depth == 32 && bitmap.use_alpha;
+
+        for y in 0..height {
+            for x in 0..width {
+                let (r, g, b) = bitmap.get_pixel_color(palettes, x as u16, y as u16);
+
+                // Get alpha:
+                // 1. For 32-bit bitmaps with use_alpha=true, ALWAYS use embedded alpha
+                // 2. For ink 36 (BgTransparent) with indexed bitmaps: color-key (index 0 = transparent)
+                // 3. For ink 8 (Matte) and other flood-fill inks: use matte
+                // 4. For ink 0 with trim_white_space: use matte
+                // 5. For other 32-bit bitmaps (use_alpha=false, no matte): use embedded alpha
+                // 6. For other bitmaps: fully opaque
+                //
+                // Special handling for 1-bit bitmaps (all inks except ink 0):
+                // Index 0 (bit=0) = background 
+                // Index 1/255 (bit=1) = foreground
+                let is_1bit_transparent = if bitmap.original_bit_depth == 1 && ink != 0 {
+                    let color_ref = bitmap.get_pixel_color_ref(x as u16, y as u16);
+                    if let ColorRef::PaletteIndex(i) = color_ref {
+                        i == 0 // Index 0 = background = transparent
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                // Special handling for ink 37/39/40 indexed bitmaps (2-8 bit):
+                // Compare RGB against sprite's bgColor (like drawing.rs lines 203-209)
+                // This matches Canvas2D: if src == bg_color, skip (transparent)
+                // Ink 9 (Mask): use the mask bitmap's grayscale as alpha
+                // Black=opaque(255), white=transparent(0), grays=partial
+                let ink9_mask_alpha: Option<u8> = if ink == 9 {
+                    if let Some(ref mask_bmp) = mask_bitmap {
+                        // Director aligns the mask to the source by their
+                        // REGISTRATION POINTS, and the two are routinely
+                        // different sizes (Candystand Miniature Golf's
+                        // "(SAVER MODELORANGE)" frames are a 191x139 source
+                        // paired with a 29x44 mask). `mask_offset` is
+                        // mask_reg - src_reg, matching the CPU renderer's
+                        // `ink9_mask_offset`; source pixels whose mask sample
+                        // falls outside the mask are NOT covered by it and so
+                        // are transparent.
+                        //
+                        // Clamping the sample into the mask instead (the old
+                        // behaviour) smeared the mask's right/bottom edge pixel
+                        // across every source pixel beyond the mask's extent,
+                        // painting an opaque bar the full width of the source
+                        // wherever that edge happened to be black.
+                        let mx_signed = x as i32 + mask_offset.0;
+                        let my_signed = y as i32 + mask_offset.1;
+                        if mx_signed < 0
+                            || my_signed < 0
+                            || mx_signed >= mask_bmp.width as i32
+                            || my_signed >= mask_bmp.height as i32
+                        {
+                            Some(0)
+                        } else {
+                            let (mr, mg, mb) =
+                                mask_bmp.get_pixel_color(palettes, mx_signed as u16, my_signed as u16);
+                            // Grayscale luminance → invert: black(0)=opaque(255), white(255)=transparent(0)
+                            let gray = ((mr as u16 + mg as u16 + mb as u16) / 3) as u8;
+                            Some(255 - gray)
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let is_ink40_indexed_bg = if is_ink40_indexed_transparent || is_ink37_indexed_transparent || is_ink39_indexed_transparent {
+                    if let Some(bg_color) = sprite_bg_color {
+                        // Compare this pixel's RGB against sprite's bgColor
+                        (r, g, b) == bg_color
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                let a = if let Some(mask_a) = ink9_mask_alpha {
+                    // Ink 9 (Mask): use mask bitmap's inverted grayscale as alpha
+                    mask_a
+                } else if is_1bit_transparent || is_ink40_indexed_bg {
+                    // 1-bit or ink 37/39/40 indexed background pixel
+                    0
+                } else if ink == 0 && use_embedded_alpha {
+                    // For 32-bit bitmaps with ink 0 (Copy) and use_alpha=true: use embedded alpha
+                    let index = (y * width + x) * 4;
+                    if index + 3 < bitmap.data.len() {
+                        bitmap.data[index + 3]
+                    } else {
+                        255
+                    }
+                } else if ink == 0 && should_use_matte {
+                    // For ink 0 (Copy) with matte (trim_white_space):
+                    if let Some(ref computed) = computed_matte {
+                        if computed[y * width + x] { 255 } else { 0 }
+                    } else if let Some(ref matte) = bitmap.matte {
+                        if matte.get_bit(x as u16, y as u16) { 255 } else { 0 }
+                    } else {
+                        255
+                    }
+                } else if ink == 0 {
+                    // For ink 0 (Copy) without matte: always fully opaque
+                    255
+                } else if use_embedded_alpha {
+                    // 32-bit with use_alpha (non-ink-0): use embedded alpha
+                    // directly, ignore any matte.
+                    let index = (y * width + x) * 4;
+                    let embedded_a = if index + 3 < bitmap.data.len() {
+                        bitmap.data[index + 3]
+                    } else {
+                        255
+                    };
+                    // Ink 36 (Background Transparent) ALSO color-keys
+                    // against sprite.bg_color — BUT only for plain
+                    // authored bitmaps. Flash captureFrame bitmaps
+                    // (`is_flash_bitmap=true`) have their transparency
+                    // already encoded by Ruffle's wmode='transparent'
+                    // treatment, so layering a second key would
+                    // destructively strip SWF artwork whose fill happens
+                    // to equal sprite.bg_color (storyscramble's chat
+                    // bubble: white-filled bubble + sprite bg=white →
+                    // entire bubble erased). Plain 32-bit-with-alpha
+                    // members (Habbo v1's `init` member is one) still
+                    // need the key so ink 36 can actually do its job.
+                    if ink == 36 && !is_flash_bitmap {
+                        if let Some(bg) = sprite_bg_color {
+                            if (r, g, b) == bg {
+                                0
+                            } else {
+                                embedded_a
+                            }
+                        } else {
+                            embedded_a
+                        }
+                    } else {
+                        embedded_a
+                    }
+                } else if should_use_colorkey_ink36 {
+                    // Ink 36: bake bgColor transparency into texture alpha
+                    // This avoids relying on shader discard which has driver issues
+                    let bg = sprite_bg_color.unwrap_or((255, 255, 255));
+                    if (r, g, b) == bg {
+                        0 // bgColor pixel → transparent
+                    } else {
+                        255
+                    }
+                } else if should_use_colorkey_ink3 || should_use_colorkey_ink33 || should_use_colorkey_ink35 || should_use_colorkey_ink36 || should_use_colorkey_ink37 || should_use_colorkey_ink39 {
+                    // Ink 3/33/35/36/37/39 color-key transparency is handled by shader
+                    // The shader compares pixel RGB with bgColor uniform
+                    // All pixels are uploaded as opaque, shader discards matching pixels
+                    // Works for indexed (2-8 bit), 16-bit, and 32-bit (without use_alpha) bitmaps
+                    // Note: 1-bit bitmaps are excluded - they use is_1bit_transparent for alpha instead
+                    255
+                } else if should_use_matte {
+                    // Use matte for inks 7, 8, 9, 41 (ink 0 matte handled above)
+                    if let Some(ref computed) = computed_matte {
+                        // Use computed flood-fill matte
+                        if computed[y * width + x] { 255 } else { 0 }
+                    } else if let Some(ref matte) = bitmap.matte {
+                        // Use pre-computed bitmap.matte
+                        if matte.get_bit(x as u16, y as u16) { 255 } else { 0 }
+                    } else {
+                        255 // No matte available, fully opaque
+                    }
+                } else if bitmap.original_bit_depth == 32 && !bitmap.use_alpha {
+                    // For 32-bit bitmaps with use_alpha=false and ink 0 (Copy):
+                    // Pixels are fully opaque (matching drawing.rs lines 1366-1367)
+                    // The embedded alpha is ignored when use_alpha is false
+                    255
+                } else {
+                    // For other bitmaps without matte conditions, all pixels are opaque
+                    255
+                };
+
+                // Apply colorize if enabled (only when has_fore_color or has_back_color is explicitly set)
+                // Matching drawing.rs lines 1304-1326 for indexed and lines 1283-1301 for 32-bit
+                let (final_r, final_g, final_b) = if allow_colorize && (has_fore || has_back) {
+                    match bitmap.original_bit_depth {
+                        // ---------- 32-BIT ----------
+                        32 => {
+                            // Treat source as grayscale intensity. When only
+                            // one of fg/bg is set, default the other to
+                            // black/white so anti-aliased edges still tint
+                            // proportionally — matching drawing.rs:2483-2492.
+                            // CS DiscoLight uses ink=0 + bgColor=random with no
+                            // foreColor; without this branch every random
+                            // bgColor falls through and the rays render as
+                            // raw white, so all four sprites look identical.
+                            let gray = ((r as u16 + g as u16 + b as u16) / 3) as u8;
+                            // Only apply the fg→bg lerp to NEAR-grayscale
+                            // pixels. Colored pixels (where R/G/B span > 16)
+                            // keep their authored RGB. Mirrors the same
+                            // guard in `drawing.rs` indexed ink:0 colorize.
+                            // Without this, a 32-bit RGBA bitmap that
+                            // contains real colored content (e.g. Habbo
+                            // Purse numeric display) gets every pixel
+                            // remapped through the fg→bg ramp on the gray
+                            // intensity — collapsing into a single tone
+                            // of brown so the on-stage render looks much
+                            // darker than the source bitmap.
+                            let max_c = r.max(g).max(b);
+                            let min_c = r.min(g).min(b);
+                            let near_grayscale = max_c.saturating_sub(min_c) <= 16;
+
+                            if ink == 36 && has_fore && !near_grayscale {
+                                // Ink 36 (BgTransparent) on a 32-bit bitmap
+                                // with explicit foreColor: multiplicative
+                                // tint. Director's CS private-studio
+                                // floor uses `sprite.color = texturecolor`
+                                // on `floor_shape_a` (a vector shape with
+                                // a pink gradient) plus ink:36 — each
+                                // visible pixel gets `src.rgb *
+                                // sprite.color / 255`, so a yellow
+                                // texturecolor (255, 255, 0) drops the
+                                // pink shape's blue channel to zero and
+                                // produces the orange/brown that then
+                                // alpha-blends onto the floor at blend %.
+                                //
+                                // Only for COLORED source pixels. A multiply
+                                // can never lift black off black — black *
+                                // anything is black — so a grayscale source
+                                // has to take the fg→bg remap below instead.
+                                // Merlin's Revenge 3 builds its HUD digits as
+                                // a runtime `image(w, h, 32)` (objTileSet
+                                // copies 1-bit glyph tiles in with copyPixels
+                                // ink 0, giving black glyphs on white), drops
+                                // it on a pooled sprite that spriteMaster
+                                // fixes at ink 36 / bgColor white, and tints
+                                // it with `sprite.color = rgb(255, 0, 0)`.
+                                // Multiplied, every glyph stayed black on a
+                                // black HUD strip — the potion counters were
+                                // laid out and drawn, just invisible.
+                                //
+                                // The bitmap's palette can't make this call:
+                                // `vector_shape.rs` rasterizes shapes with
+                                // the built-in GrayScale palette, so the CS
+                                // floor claims to be grayscale as well. The
+                                // pixels tell the truth — a pink gradient is
+                                // not near-grayscale, glyph art is.
+                                (
+                                    ((r as u16 * fg_rgb.0 as u16) / 255) as u8,
+                                    ((g as u16 * fg_rgb.1 as u16) / 255) as u8,
+                                    ((b as u16 * fg_rgb.2 as u16) / 255) as u8,
+                                )
+                            } else if near_grayscale
+                                && (has_fore || has_back)
+                                // Ink 36 has no `use_back_color` entry (its
+                                // bg is the color-key, not a ramp endpoint),
+                                // so admit it explicitly; eff_bg then
+                                // defaults to white, which the ink-36
+                                // color-key drops to transparent anyway.
+                                && (use_back_color || (ink == 36 && has_fore))
+                            {
+                                let eff_fg = if has_fore { fg_rgb } else { (0u8, 0u8, 0u8) };
+                                let eff_bg = if has_back { bg_rgb } else { (255u8, 255u8, 255u8) };
+                                let t = gray as f32 / 255.0;
+                                (
+                                    ((1.0 - t) * eff_fg.0 as f32 + t * eff_bg.0 as f32) as u8,
+                                    ((1.0 - t) * eff_fg.1 as f32 + t * eff_bg.1 as f32) as u8,
+                                    ((1.0 - t) * eff_fg.2 as f32 + t * eff_bg.2 as f32) as u8,
+                                )
+                            } else if near_grayscale && has_fore && gray <= 1 {
+                                // Replace near-black with fg color
+                                fg_rgb
+                            } else {
+                                (r, g, b)
+                            }
+                        }
+
+                        // ---------- 1-BIT BITMAPS ----------
+                        1 => {
+                            // For 1-bit bitmaps with ink 0, 1 or 36:
+                            // - foreground (index 255, bit=1)
+                            // - background (index 0, bit=0) 
+                            // Note: 1-bit bitmaps store indices as 0 and 255 (not 0 and 1)
+                            let color_ref = bitmap.get_pixel_color_ref(x as u16, y as u16);
+                            if let ColorRef::PaletteIndex(i) = color_ref {
+                                if i != 0 {
+                                    // Foreground bit (index 255)
+                                    if has_fore {
+                                        fg_rgb
+                                    } else {
+                                        (r, g, b)
+                                    }
+                                } else {
+                                    // Background bit (index 0)
+                                    if has_back && use_back_color {
+                                        bg_rgb
+                                    } else {
+                                        (r, g, b)
+                                    }
+                                }
+                            } else {
+                                (r, g, b)
+                            }
+                        }
+
+                        // ---------- INDEXED (2-8 bit) ----------
+                        _ => {
+                            // Get palette index
+                            let color_ref = bitmap.get_pixel_color_ref(x as u16, y as u16);
+
+                            if let ColorRef::PaletteIndex(i) = color_ref {
+                                // Ink 36 special case: foreColor tinting for monochrome-style bitmaps
+                                // See drawing.rs lines 1172-1176: index 255 or black pixels get foreColor
+                                // Note: Ink 40 does NOT apply foreColor tinting - it just uses color-key transparency
+                                if ink36_indexed_tint {
+                                    if i == 255 || (r == 0 && g == 0 && b == 0) {
+                                        fg_rgb
+                                    } else {
+                                        (r, g, b)
+                                    }
+                                } else {
+                                    // General indexed colorize
+                                    let max = (1u16 << bitmap.original_bit_depth) - 1;
+                                    let t = i as f32 / max as f32;
+
+                                    if (has_fore || has_back) && use_back_color {
+                                        // Interpolate between fg and bg based on palette index
+                                        (
+                                            ((1.0 - t) * fg_rgb.0 as f32 + t * bg_rgb.0 as f32) as u8,
+                                            ((1.0 - t) * fg_rgb.1 as f32 + t * bg_rgb.1 as f32) as u8,
+                                            ((1.0 - t) * fg_rgb.2 as f32 + t * bg_rgb.2 as f32) as u8,
+                                        )
+                                    } else if has_fore && i == 0 {
+                                        // Replace palette index 0 with fg color
+                                        fg_rgb
+                                    } else {
+                                        (r, g, b)
+                                    }
+                                }
+                            } else {
+                                (r, g, b)
+                            }
+                        }
+                    }
+                } else {
+                    (r, g, b)
+                };
+
+                if a > 0 {
+                    opaque_count += 1;
+                } else {
+                    transparent_count += 1;
+                }
+
+                rgba_data.push(final_r);
+                rgba_data.push(final_g);
+                rgba_data.push(final_b);
+                rgba_data.push(a);
+            }
+        }
+
+        // Unused variables to suppress warnings
+        let _ = is_grayscale;
+        let _ = opaque_count;
+        let _ = transparent_count;
+
+        rgba_data
+    }
+
+    /// Compute a matte mask using flood-fill from all edges for INDEXED bitmaps
+    ///
+    /// This compares PALETTE INDICES (not RGB values), matching how Canvas2D's
+    /// create_matte works. Background is palette index 0.
+    fn compute_edge_matte_mask_indexed(
+        bitmap: &Bitmap,
+        width: usize,
+        height: usize,
+    ) -> Vec<bool> {
+        // Start with all pixels visible (true)
+        let mut matte = vec![true; width * height];
+
+        // Track which pixels we've visited during flood fill
+        let mut visited = vec![false; width * height];
+
+        // Stack for flood fill (use iterative approach to avoid stack overflow)
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+
+        // Background color is palette index 0
+        let bg_color_ref = ColorRef::PaletteIndex(0);
+
+        // Helper to check if a pixel matches the background color (by palette index)
+        let matches_bg = |x: usize, y: usize| -> bool {
+            let pixel_ref = bitmap.get_pixel_color_ref(x as u16, y as u16);
+            pixel_ref == bg_color_ref
+        };
+
+        // Seed the flood fill from all edge pixels that match bg color
+        // Top and bottom edges
+        for x in 0..width {
+            if matches_bg(x, 0) {
+                stack.push((x, 0));
+            }
+            if height > 1 && matches_bg(x, height - 1) {
+                stack.push((x, height - 1));
+            }
+        }
+        // Left and right edges (skip corners, already added)
+        for y in 1..height.saturating_sub(1) {
+            if matches_bg(0, y) {
+                stack.push((0, y));
+            }
+            if width > 1 && matches_bg(width - 1, y) {
+                stack.push((width - 1, y));
+            }
+        }
+
+        // Flood fill - mark connected bg-color pixels as transparent
+        while let Some((x, y)) = stack.pop() {
+            let idx = y * width + x;
+
+            // Skip if already visited
+            if visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
+
+            // Check if this pixel matches bg color (by palette index)
+            if !matches_bg(x, y) {
+                continue;
+            }
+
+            // Mark as transparent
+            matte[idx] = false;
+
+            // Add neighbors to stack (4-connected)
+            if x > 0 {
+                stack.push((x - 1, y));
+            }
+            if x + 1 < width {
+                stack.push((x + 1, y));
+            }
+            if y > 0 {
+                stack.push((x, y - 1));
+            }
+            if y + 1 < height {
+                stack.push((x, y + 1));
+            }
+        }
+
+        matte
+    }
+
+    /// Compute a matte mask using flood-fill from all edges for non-indexed bitmaps
+    ///
+    /// This compares RGB values, used for 16-bit bitmaps with ink 0 (Copy).
+    fn compute_edge_matte_mask_rgb(
+        bitmap: &Bitmap,
+        palettes: &crate::player::bitmap::palette_map::PaletteMap,
+        bg_color_rgb: (u8, u8, u8),
+        width: usize,
+        height: usize,
+    ) -> Vec<bool> {
+        // Start with all pixels visible (true)
+        let mut matte = vec![true; width * height];
+
+        // Track which pixels we've visited during flood fill
+        let mut visited = vec![false; width * height];
+
+        // Stack for flood fill (use iterative approach to avoid stack overflow)
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+
+        // Resolve the palette ONCE. `bitmap.get_pixel_color` ran a full
+        // `resolve_color_ref` — palette-map lookup, `find_by_member`, the lot —
+        // for every probe; the table makes a probe an array index.
+        //
+        // The probing itself stays LAZY. Precomputing an is-background flag for
+        // the whole bitmap up front is slower in practice: the flood fill only
+        // ever reaches the border plus the connected background, so an eager
+        // W*H pass does strictly more work than the fill it feeds, and it
+        // measurably regressed this function.
+        let palette_table = crate::player::bitmap::bitmap::resolve_palette_table(
+            palettes,
+            &bitmap.palette_ref,
+            bitmap.original_bit_depth,
+        );
+        let matches_bg = |x: usize, y: usize| -> bool {
+            let (r, g, b) = bitmap.get_pixel_color_fast(&palette_table, x as u16, y as u16);
+            r == bg_color_rgb.0 && g == bg_color_rgb.1 && b == bg_color_rgb.2
+        };
+
+        // Seed the flood fill from all edge pixels that match bg color
+        // Top and bottom edges
+        for x in 0..width {
+            if matches_bg(x, 0) {
+                stack.push((x, 0));
+            }
+            if height > 1 && matches_bg(x, height - 1) {
+                stack.push((x, height - 1));
+            }
+        }
+        // Left and right edges (skip corners, already added)
+        for y in 1..height.saturating_sub(1) {
+            if matches_bg(0, y) {
+                stack.push((0, y));
+            }
+            if width > 1 && matches_bg(width - 1, y) {
+                stack.push((width - 1, y));
+            }
+        }
+
+        // Flood fill - mark connected bg-color pixels as transparent
+        while let Some((x, y)) = stack.pop() {
+            let idx = y * width + x;
+
+            // Skip if already visited
+            if visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
+
+            // Check if this pixel matches bg color (by RGB)
+            if !matches_bg(x, y) {
+                continue;
+            }
+
+            // Mark as transparent
+            matte[idx] = false;
+
+            // Add neighbors to stack (4-connected)
+            if x > 0 {
+                stack.push((x - 1, y));
+            }
+            if x + 1 < width {
+                stack.push((x + 1, y));
+            }
+            if y > 0 {
+                stack.push((x, y - 1));
+            }
+            if y + 1 < height {
+                stack.push((x, y + 1));
+            }
+        }
+
+        matte
+    }
+
+    /// Check if ink mode requires matte computation
+    /// Matches Canvas2D's should_matte_sprite function
+    fn should_matte_sprite(ink: i32) -> bool {
+        // Only the flood-fill MATTE inks. Inks 3/33/35/36/37/39/40 use a shader
+        // (or baked) COLOR-KEY in bitmap_to_rgba, not the matte, so pre-computing
+        // a flood-fill matte for them was ~2.3ms/sprite of pure waste (g349's
+        // ink-36 tiles). See `should_use_matte` in bitmap_to_rgba.
+        ink == 41 || ink == 8 || ink == 7 || ink == 32
+    }
+
+    /// Get or create a texture for a bitmap member
+    ///
+    /// The ink is included in the cache key because 32-bit bitmaps with ink 8 (Matte)
+    /// need matte computation while other inks use the embedded alpha.
+    ///
+    /// Capture the current 3D FBO pixels into w3d_frame_buffers for world.image access
+    fn capture_w3d_frame(&mut self, player: &mut DirPlayer, member_key: (i32, i32), width: u32, height: u32) {
+        use crate::player::bitmap::bitmap::{Bitmap, PaletteRef, get_system_default_palette};
+
+        let gl = self.context.gl();
+        if let Some(fbo) = &self.scene3d.fbo {
+            gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, Some(fbo));
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            let _ = gl.read_pixels_with_opt_u8_array(
+                0, 0, width as i32, height as i32,
+                WebGl2RenderingContext::RGBA,
+                WebGl2RenderingContext::UNSIGNED_BYTE,
+                Some(&mut pixels),
+            );
+            gl.bind_framebuffer(WebGl2RenderingContext::READ_FRAMEBUFFER, None);
+
+            // Flip vertically (WebGL is bottom-to-top)
+            let row_size = (width * 4) as usize;
+            let mut flipped = vec![0u8; pixels.len()];
+            for y in 0..height as usize {
+                let src_row = (height as usize - 1 - y) * row_size;
+                let dst_row = y * row_size;
+                flipped[dst_row..dst_row + row_size].copy_from_slice(&pixels[src_row..src_row + row_size]);
+            }
+
+            let mut bitmap = Bitmap::new(
+                width as u16, height as u16, 32, 32, 8,
+                PaletteRef::BuiltIn(get_system_default_palette()),
+            );
+            bitmap.data = flipped;
+            bitmap.use_alpha = true;
+
+            if let Some(&existing_ref) = player.w3d_frame_buffers.get(&member_key) {
+                player.bitmap_manager.replace_bitmap(existing_ref, bitmap);
+            } else {
+                let bitmap_ref = player.bitmap_manager.add_bitmap(bitmap);
+                player.w3d_frame_buffers.insert(member_key, bitmap_ref);
+            }
+        }
+    }
+
+    /// Colorize parameters are also included in the cache key because Director's colorize
+    /// feature remaps palette indices to interpolate between fore and back colors.
+    fn get_or_create_texture(
+        &mut self,
+        player: &mut DirPlayer,
+        member_ref: &CastMemberRef,
+        image_ref: u32,
+        ink: i32,
+        colorize: Option<(bool, bool, u8, u8, u8, u8, u8, u8)>,
+        sprite_bg_color: Option<(u8, u8, u8)>,
+        is_flash_bitmap: bool,
+    ) -> Option<(web_sys::WebGlTexture, u32, u32)> {
+        // For inks that need matte, ensure create_matte is called first
+        // This matches Canvas2D behavior in rendering.rs
+        // EXCEPTION: For 32-bit bitmaps with use_alpha=true, we use the embedded alpha channel
+        // instead of computing a matte (matching drawing.rs lines 1268-1269)
+        if Self::should_matte_sprite(ink) {
+            // Check if matte needs creating with immutable borrow first,
+            // to avoid bumping bitmap version unnecessarily (get_bitmap_mut increments version)
+            let needs_matte = player.bitmap_manager.get_bitmap(image_ref)
+                .map(|b| b.matte.is_none() && !(b.original_bit_depth == 32 && b.use_alpha))
+                .unwrap_or(false);
+            if needs_matte {
+                let palettes = player.movie.cast_manager.palettes();
+                if let Some(bitmap) = player.bitmap_manager.get_bitmap_mut(image_ref) {
+                    bitmap.create_matte(&palettes);
+                }
+            }
+        }
+
+        // Get bitmap data to check version
+        let bitmap = player.bitmap_manager.get_bitmap(image_ref)?;
+        // Skip rendering for empty bitmaps (data empty OR zero dimensions).
+        // Director's empty cast members (e.g. cc.jukebox.catalog.add.btn.dim
+        // — placeholder bitmaps with rect 0,0,0,0) are rendered as nothing in
+        // Shockwave; without the dimension guard dirplayer-rs's WebGL2 path
+        // would fall through and paint the sprite's rect as a solid white bar.
+        if bitmap.data.is_empty() || bitmap.width == 0 || bitmap.height == 0 {
+            return None;
+        }
+
+        let bitmap_version = bitmap.version;
+        let width = bitmap.width as u32;
+        let height = bitmap.height as u32;
+
+        // Create cache key including ink, colorize, and sprite_bg_color for inks that use bgColor matte
+        // These inks use bgColor for matte/transparency computation:
+        // - Ink 7: indexed bitmaps (not ghost - skips bgColor pixels via flood-fill matte)
+        // - Ink 8: indexed bitmaps and 32-bit bitmaps without use_alpha (flood-fill matte)
+        // - Ink 9: 32-bit bitmaps without use_alpha (mask with bgColor-based matte)
+        // - Ink 40: indexed bitmaps (lighten - skips bgColor pixels via RGB comparison)
+        // Note: Ink 33 uses shader color-key, not texture matte, so no bgColor in cache key
+        // Note: Ink 41 (Darken) uses bitmap's structural bg (palette idx 0 / white), not the
+        //       sprite's bgColor — the bgColor only tints in the shader uniform — so the texture
+        //       does not depend on sprite_bg_color and must not be in the cache key.
+        let is_ink_with_bgcolor_matte =
+            ((ink == 7 || ink == 8 || ink == 36 || ink == 37 || ink == 39 || ink == 40) && bitmap.original_bit_depth >= 2 && bitmap.original_bit_depth <= 8)
+            || ((ink == 0 || ink == 8) && bitmap.original_bit_depth == 32 && !bitmap.use_alpha)
+            || (ink == 9 && bitmap.original_bit_depth == 32 && !bitmap.use_alpha)
+            || (ink == 36 && bitmap.original_bit_depth == 32 && bitmap.use_alpha);
+        let cache_key_bg_color = if is_ink_with_bgcolor_matte {
+            sprite_bg_color
+        } else {
+            None
+        };
+        let cache_key = TextureCacheKey {
+            member_ref: member_ref.clone(),
+            image_ref,
+            ink,
+            colorize,
+            sprite_bg_color: cache_key_bg_color,
+        };
+
+        // Check cache - return cached texture if version matches
+        if let Some(cached) = self.texture_cache.get(&cache_key) {
+            if cached.version == bitmap_version {
+                return Some((cached.texture.clone(), cached.width, cached.height));
+            }
+            // Version changed - texture needs to be re-uploaded
+        }
+
+        // Convert bitmap to RGBA format with ink for matte computation
+        let palettes = player.movie.cast_manager.palettes();
+
+        // Only log on the very first frame for any new texture
+        let _is_first_creation = self.frame_count == 1 && !self.texture_cache.has(&cache_key);
+
+        // For ink 9 (Mask), find the mask bitmap: the next cast member (member+1),
+        // together with the registration-point delta Director aligns it by.
+        let (mask_bitmap_ref, mask_offset) = if ink == 9 {
+            let src_reg = player
+                .movie
+                .cast_manager
+                .find_member_by_ref(member_ref)
+                .and_then(|m| match &m.member_type {
+                    CastMemberType::Bitmap(bm) => {
+                        Some((bm.reg_point.0 as i32, bm.reg_point.1 as i32))
+                    }
+                    _ => None,
+                })
+                .unwrap_or((0, 0));
+            let mask_member_ref = CastMemberRef {
+                cast_lib: member_ref.cast_lib,
+                cast_member: member_ref.cast_member + 1,
+            };
+            let mask_member = player.movie.cast_manager.find_member_by_ref(&mask_member_ref);
+            let mask_reg = match mask_member.as_ref().map(|m| &m.member_type) {
+                Some(CastMemberType::Bitmap(bm)) => {
+                    (bm.reg_point.0 as i32, bm.reg_point.1 as i32)
+                }
+                // No mask member: the offset is unused, but keep it neutral.
+                _ => src_reg,
+            };
+            let bmp = mask_member
+                .and_then(|m| {
+                    if let CastMemberType::Bitmap(bm) = &m.member_type {
+                        Some(bm.image_ref)
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|img_ref| player.bitmap_manager.get_bitmap(img_ref))
+                .map(|b| b.clone());
+            (bmp, (mask_reg.0 - src_reg.0, mask_reg.1 - src_reg.1))
+        } else {
+            (None, (0, 0))
+        };
+
+        let rgba_data = Self::bitmap_to_rgba(bitmap, &palettes, ink, colorize, sprite_bg_color, mask_bitmap_ref.as_ref(), mask_offset, is_flash_bitmap);
+
+        // Validate data size
+        let expected_size = (width * height * 4) as usize;
+        if rgba_data.len() != expected_size {
+            web_sys::console::warn_1(
+                &format!(
+                    "WebGL2: RGBA data size mismatch for member {:?}: expected {}, got {}",
+                    member_ref, expected_size, rgba_data.len()
+                ).into()
+            );
+            return None;
+        }
+
+        // Create texture
+        let texture = self.context.create_texture().ok()?;
+
+        // Upload RGBA data to texture
+        self.context
+            .upload_texture_rgba(
+                &texture,
+                width,
+                height,
+                &rgba_data,
+            )
+            .ok()?;
+
+        // Cache the texture with current bitmap version
+        let gl = self.context.gl().clone();
+        self.texture_cache.insert(
+            &gl,
+            cache_key,
+            texture.clone(),
+            width,
+            height,
+            bitmap_version,
+        );
+
+        Some((texture, width, height))
+    }
+
+    /// Get or create a 1x1 solid color texture for shape rendering
+    fn get_or_create_solid_color_texture(&mut self, r: u8, g: u8, b: u8) -> web_sys::WebGlTexture {
+        let key = (r, g, b);
+
+        // Check if we already have this color cached
+        if let Some(texture) = self.solid_color_textures.get(&key) {
+            return texture.clone();
+        }
+
+        // Create a new 1x1 RGBA texture with the solid color
+        let rgba_data: [u8; 4] = [r, g, b, 255];
+
+        let texture = self.context.create_texture().expect("Failed to create solid color texture");
+
+        self.context
+            .upload_texture_rgba(&texture, 1, 1, &rgba_data)
+            .expect("Failed to upload solid color texture");
+
+        // Cache the texture
+        self.solid_color_textures.insert(key, texture.clone());
+
+        texture
+    }
+
+    /// Check if a font is actually available in the browser's Canvas2D.
+    /// Compares measureText widths against known fallbacks to detect substitution.
+    fn is_font_available_in_canvas2d(font_name: &str, font_size: u16) -> bool {
+        let check = || -> Option<bool> {
+            let document = web_sys::window()?.document()?;
+            let canvas: web_sys::HtmlCanvasElement = document
+                .create_element("canvas").ok()?
+                .dyn_into().ok()?;
+            canvas.set_width(1);
+            canvas.set_height(1);
+            let ctx: web_sys::CanvasRenderingContext2d = canvas
+                .get_context("2d").ok()??
+                .dyn_into().ok()?;
+
+            let test_str = "ABCDwxyz0189";
+
+            ctx.set_font(&format!("{}px {}", font_size, font_name));
+            let requested_width = ctx.measure_text(test_str).ok()?.width();
+
+            ctx.set_font(&format!("{}px sans-serif", font_size));
+            let sans_width = ctx.measure_text(test_str).ok()?.width();
+
+            ctx.set_font(&format!("{}px serif", font_size));
+            let serif_width = ctx.measure_text(test_str).ok()?.width();
+
+            Some(requested_width != sans_width && requested_width != serif_width)
+        };
+        check().unwrap_or(false)
+    }
+
+    /// Render text to a CPU bitmap, then upload as a WebGL texture
+    ///
+    /// This allows us to reuse the existing text rendering code from Canvas2D
+    /// while still benefiting from GPU compositing for the final render.
+    #[allow(clippy::too_many_arguments)]
+    fn render_text_to_texture(
+        &mut self,
+        player: &mut DirPlayer,
+        cache_key: &RenderedTextCacheKey,
+        text: &str,
+        font_name: &str,
+        font_size: u16,
+        font_style: Option<u8>,
+        font_id: Option<u16>,
+        line_spacing: u16,
+        top_spacing: i16,
+        member_top_spacing: i16,
+        bottom_spacing: i16,
+        width: u32,
+        height: u32,
+        // Width to use for word-wrap calculations. May be smaller than
+        // `width` when the field's text-wrap width (`field.width`) is
+        // narrower than the sprite display rect. Set to `width` for
+        // non-field text where the two are the same.
+        wrap_width: u32,
+        ink: i32,
+        blend: i32,
+        fg_color: &ColorRef,
+        bg_color: &ColorRef,
+        styled_spans: Option<&Vec<StyledSpan>>,
+        alignment: BuiltInSymbol,
+        word_wrap: bool,
+        border: u16,
+        box_drop_shadow: u16,
+        scrollbar: Option<(crate::player::score::FieldScrollbar, i32)>,
+        tab_stops: &[crate::player::cast_member::TabStop],
+        // Per-text-line line_spacing override from XMED par_run / par_info
+        // tables. Length equals (count of \r/\n in `text`) + 1 — i.e. one
+        // entry per text-line. Empty when the member has no per-paragraph
+        // spacing data; the renderer then falls back to the single
+        // `line_spacing` arg above.
+        per_line_spacings: &[u16],
+        // Per-text-line par_info index parallel to `per_line_spacings`.
+        // The styled bitmap rendering path uses this to detect
+        // source-paragraph transitions and apply `\sa` + `\sb` boundary
+        // spacing once between paragraphs.
+        per_line_par_idx: &[u16],
+        // XMED par_info / par_run tables for paragraph-boundary spacing
+        // (`\sa` + `\sb` applied at par_info transitions). Forwarded
+        // verbatim to `render_native_text_to_bitmap`.
+        par_infos_for_native: &[crate::director::chunks::xmedia_styled_text::ParInfo],
+        par_runs_for_native: &[crate::director::chunks::xmedia_styled_text::ParRun],
+        char_spacing: i32,
+    ) -> Option<(web_sys::WebGlTexture, u32, u32)> {
+        // Whether to keep the bitmap at the authored height (no shrink-to-
+        // content, no fill-scaling). True when the sprite carries a skew or
+        // rotation; the texture must match the authored sprite_rect 1:1 so
+        // the parallelogram on stage shows text at the right proportions
+        // instead of stretching a tight texture into a tilted larger rect.
+        let keep_authored_height = cache_key.keep_authored_height;
+        // Stage auto-scale: when drawRect > movie.rect, caller-provided width/
+        // height are already scaled (via get_concrete_sprite_render_rect), but
+        // font_size and line spacing are not. Scale them here so the text
+        // rasterizes at the target resolution — crisp in the enlarged viewport
+        // rather than a stretched low-res bitmap. Uniform scale factor is used
+        // so text preserves its font's aspect ratio regardless of drawRect
+        // non-uniformity.
+        let (scale_x, scale_y) = crate::player::stage::stage_scale(player);
+        let scale = scale_x.min(scale_y);
+        let font_size = ((font_size as f64) * scale).round().max(1.0) as u16;
+        let line_spacing = ((line_spacing as f64) * scale).round() as u16;
+        let top_spacing = ((top_spacing as f64) * scale).round() as i16;
+        let member_top_spacing = ((member_top_spacing as f64) * scale).round() as i16;
+        let bottom_spacing = ((bottom_spacing as f64) * scale).round() as i16;
+        let styled_spans_scaled: Option<Vec<StyledSpan>> = styled_spans.map(|spans| {
+            spans.iter().map(|s| {
+                let mut style = s.style.clone();
+                if let Some(sz) = style.font_size {
+                    style.font_size = Some(((sz as f64) * scale).round().max(1.0) as i32);
+                }
+                StyledSpan { text: s.text.clone(), style }
+            }).collect()
+        });
+        let styled_spans = styled_spans_scaled.as_ref();
+        let styled_span_count = styled_spans.map_or(0, |s| s.len());
+        // Use the text member's own font_size for PFR rasterization target.
+        // Taking the max of styled span sizes causes pixel fonts to be rasterized
+        // at the wrong size (e.g. 15 instead of 12), producing wrong glyph shapes.
+        let requested_font_size = font_size;
+        if DEBUG_WEBGL2_TEXT {
+            debug!(
+                "[webgl2.text] text_len={} spans={} font='{}' in_size={} req={} box={}x{} wrap={} align='{}'",
+                text.len(),
+                styled_span_count,
+                font_name,
+                font_size,
+                requested_font_size,
+                width,
+                height,
+                word_wrap,
+                alignment
+            );
+        }
+
+        // Get or load the font
+        let font = {
+            let mut font_opt = player.font_manager.get_font_with_cast_and_bitmap(
+                font_name,
+                &player.movie.cast_manager,
+                &mut player.bitmap_manager,
+                Some(requested_font_size),
+                font_style,
+            );
+
+            let mut lookup_method = "name";
+
+            // Try font_id-based lookup if name-based lookup failed
+            if font_opt.is_none() {
+                if let Some(id) = font_id {
+                    if let Some(font_ref) = player.font_manager.font_by_id.get(&id).copied() {
+                        if let Some(font) = player.font_manager.fonts.get(&font_ref) {
+                            font_opt = Some(font.clone());
+                            lookup_method = "font_id";
+                        }
+                    }
+                }
+            }
+
+            // Try case-insensitive match in font cache before falling back to system font
+            if font_opt.is_none() {
+                let font_name_lower = font_name.to_lowercase();
+                for (key, font) in player.font_manager.font_cache.iter() {
+                    if key.to_lowercase() == font_name_lower
+                        || key.to_lowercase().starts_with(&format!("{}_", font_name_lower))
+                    {
+                        font_opt = Some(font.clone());
+                        lookup_method = "cache_case_insensitive";
+                        break;
+                    }
+                }
+            }
+
+            // PFR canonical fallback: if a PFR font with matching canonical name exists
+            // in the cache, prefer it over falling back to system font / Canvas2D native.
+            // Director movies embed PFR fonts to be used for all matching text — the PFR
+            // font name may differ slightly from the text member's font reference.
+            if font_opt.is_none() && !font_name.is_empty() {
+                use crate::player::font::FontManager;
+                let canon = FontManager::canonical_font_name(font_name);
+                if !canon.is_empty() {
+                    for (_key, font) in player.font_manager.font_cache.iter() {
+                        if font.char_widths.is_some() && FontManager::canonical_font_name(&font.font_name) == canon {
+                            font_opt = Some(font.clone());
+                            lookup_method = "pfr_canonical_fallback";
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if font_opt.is_none() {
+                lookup_method = "system_fallback";
+
+                if DEBUG_WEBGL2_TEXT {
+                    web_sys::console::warn_1(
+                        &format!(
+                            "WebGL2 text: font '{}' (id={:?}) not found, using system font. Available fonts: {:?}",
+                            font_name, font_id,
+                            player.font_manager.font_cache.keys().collect::<Vec<_>>()
+                        ).into()
+                    );
+                }
+            }
+
+            let result = font_opt.or_else(|| player.font_manager.get_system_font());
+
+            if DEBUG_WEBGL2_TEXT {
+                if let Some(ref f) = result {
+                    web_sys::console::log_1(
+                        &format!("WebGL2 text: using font '{}' (lookup={}, pfr={}, size={}x{})",
+                            f.font_name, lookup_method, f.char_widths.is_some(),
+                            f.char_width, f.char_height).into()
+                    );
+                }
+            }
+            result
+        };
+
+        let font = match font {
+            Some(f) => f,
+            None => {
+                // No font available - log warning and return None
+                web_sys::console::warn_1(
+                    &format!("WebGL2 render_text_to_texture: No font found for '{}' size {}", font_name, font_size).into()
+                );
+                return None;
+            }
+        };
+
+        let is_pfr_font = font.char_widths.is_some();
+        if DEBUG_WEBGL2_TEXT {
+            debug!(
+                "[webgl2.text] selected font='{}' pfr={} font_size={} char={}x{} bitmap_ref={}",
+                font.font_name,
+                is_pfr_font,
+                font.font_size,
+                font.char_width,
+                font.char_height,
+                font.bitmap_ref
+            );
+        }
+        let style_bits = font_style.unwrap_or(font.font_style);
+        let bold = (style_bits & 1) != 0;
+        let italic = (style_bits & 2) != 0;
+        let underline = (style_bits & 4) != 0;
+        // let alignment_key = alignment.trim().trim_start_matches('#').to_ascii_lowercase();
+
+        // Get the font bitmap. We clone it locally so the immutable
+        // borrow on `player.bitmap_manager` is released — the PFR
+        // multi-span path below needs to call back into
+        // `player.font_manager.get_font_with_cast_and_bitmap` (which
+        // mutably borrows `bitmap_manager`) to load per-span variant
+        // atlases. Cloning ~88KB once per render is cheap vs. the
+        // borrow-checker dance of holding the original `&Bitmap`.
+        let font_bitmap_owned = match player.bitmap_manager.get_bitmap(font.bitmap_ref) {
+            Some(b) => b.clone(),
+            None => {
+                // Font bitmap not found - log warning and return None
+                web_sys::console::warn_1(
+                    &format!("WebGL2 render_text_to_texture: Font bitmap {} not found", font.bitmap_ref).into()
+                );
+                return None;
+            }
+        };
+        let font_bitmap = &font_bitmap_owned;
+
+        let mut render_width = width as u16;
+        let mut render_height = height as u16;
+        let mut render_line_spacing = line_spacing;
+        // Width used for word-wrap measurement (text fold point). Defaults
+        // to render_width but can be smaller for fields where the
+        // text-wrap area is narrower than the sprite display rect.
+        let render_wrap_width = (wrap_width as u16).min(render_width);
+
+        // Measure actual text height and shrink render_height if the measured
+        // content is smaller. Never grow beyond the member's rect — the rect
+        // defines the visual boundary and the background fill must not exceed it.
+        // Only shrink when a real PFR bitmap font is loaded — for system fonts
+        // measure_text uses the system_font fallback (small char_height) which
+        // returns wrong measurements that would shrink the rect incorrectly.
+        let is_pfr_font_for_shrink = font.char_widths.is_some();
+        if is_pfr_font_for_shrink {
+            // When every per-line entry is non-zero (every paragraph has an
+            // explicit dword270), summing them gives the exact authored
+            // bitmap height — Junkbot's level-name column 15×21+16=331,
+            // matches Director. But when entries are 0 ("auto, derive from
+            // span size"), the sum is meaningless (Junkbot brick-info
+            // member 139: only line 22 = 6, others = 0 → sum = 6 would
+            // crop the bitmap to 6 px tall and clip the entire column).
+            // Fall back to measure_text in that case.
+            let per_line_all_nonzero = !per_line_spacings.is_empty()
+                && per_line_spacings.iter().all(|&s| s > 0);
+            let measured_h_raw = if per_line_all_nonzero {
+                per_line_spacings.iter().map(|&s| s as u32).sum::<u32>() as u16
+            } else if word_wrap && render_wrap_width > 0 {
+                measure_text_wrapped(
+                    text, &font, render_wrap_width, true,
+                    render_line_spacing, top_spacing, bottom_spacing, 0,
+                ).1
+            } else {
+                measure_text(
+                    text, &font, None, render_line_spacing, top_spacing, bottom_spacing,
+                ).1
+            };
+            let measured_h = measured_h_raw
+                + (2 * border) + (4 * box_drop_shadow);
+            if measured_h > 0 && measured_h < render_height && !keep_authored_height {
+                // Doesn't qualify for fill-scaling: shrink bitmap to content
+                // (preserve tight bounds for chat bubbles, button labels,
+                // BossBot letters, etc.).
+                //
+                // The previous "fill-to-sprite_rect" hack (qualifies_fill
+                // block) used to inflate render_line_spacing for tall
+                // multi-line lists like Junkbot's level.num/level.name —
+                // back when the par_run/par_info parser couldn't derive
+                // the authored stride correctly and the heuristic gave 16
+                // instead of 21. Now that `text_member.fixed_line_space`
+                // is derived from par_run[0]'s par_info (the authoritative
+                // source for member.fixedLineSpace), the parser feeds the
+                // correct authored value (21 for level.num) and the hack
+                // is no longer needed.
+                render_height = measured_h;
+            }
+            let natural_lh = if font.font_size > 0 {
+                font.font_size as u32
+            } else {
+                font.char_height as u32
+            };
+            // 2.5× covers legitimate "double-spaced" or wide-leading lines
+            // (CSS line-height 2 ≈ 2× font-size) but rejects anything that
+            // looks like a field-height-misparsed value.
+            if natural_lh > 0 && (render_line_spacing as u32) > natural_lh * 5 / 2 {
+                render_line_spacing = 0;
+            }
+        }
+        // Safety net previously reset render_line_spacing to 0 when the
+        // requested stride × line_count exceeded render_height, on the
+        // theory that XMED sometimes stored the field box-height in
+        // fixed_line_space. With par_run[0]-derived fixed_line_space the
+        // value is the real per-line stride, and Junkbot level.num
+        // (16 × 21 = 336 in a 331-px rect) trips the >render_height
+        // condition by 5 px and would have reset to 0 — clipping the
+        // last line. The safety net is removed; if a future member
+        // surfaces with a bogus fixed_line_space we'll address it at
+        // the parser source rather than via runtime override.
+
+        // Compute alignment offset for bitmap font rendering (native text handles alignment internally).
+        let mut bitmap_start_x = 0i32;
+        if styled_spans.is_none() && !word_wrap {
+            let (line_width, _) = if is_pfr_font {
+                measure_text(text, &font, Some(font.char_height), 0, top_spacing, bottom_spacing)
+            } else {
+                measure_text(text, &font, None, render_line_spacing, top_spacing, bottom_spacing)
+            };
+            let box_width = width as i32;
+            let line_width = line_width as i32;
+            match alignment {
+                BuiltInSymbol::Center => bitmap_start_x = ((box_width - line_width) / 2).max(0),
+                BuiltInSymbol::Right => bitmap_start_x = (box_width - line_width).max(0),
+                _ => {}
+            }
+        }
+
+        // Create a 32-bit RGBA bitmap for rendering text
+        let mut text_bitmap = Bitmap::new(
+            render_width,
+            render_height,
+            32,
+            32,
+            0,
+            PaletteRef::BuiltIn(get_system_default_palette()),
+        );
+
+        // Initialize as fully transparent (alpha=0).
+        // PFR and Canvas2D rendering will write text pixels with alpha>0.
+        // Background detection then simply checks alpha==0.
+        text_bitmap.data.fill(0);
+
+        let palettes = player.movie.cast_manager.palettes();
+
+        // Check glyph preference to allow runtime switching
+        let glyph_pref = get_glyph_preference();
+
+        // PFR fonts with char_widths have a valid bitmap atlas from the PFR rasterizer.
+        // Never use Canvas2D native for these — the PFR font name (e.g. "v") is not
+        // registered in the browser, so Canvas2D fillText would fall back to a system font.
+        let use_native_for_pfr = match glyph_pref {
+            GlyphPreference::Native => true,  // Force native even for PFR
+            GlyphPreference::Bitmap | GlyphPreference::Outline => false,  // Force bitmap atlas
+            GlyphPreference::Auto => {
+                if is_pfr_font {
+                    if font.char_widths.is_some() {
+                        // PFR rasterized font — use bitmap rendering
+                        false
+                    } else {
+                        Self::is_font_available_in_canvas2d(&font.font_name, font_size)
+                    }
+                } else {
+                    false
+                }
+            }
+        };
+
+        // Build synthetic spans for native rendering (non-PFR fonts OR PFR with system equivalent).
+        // This ensures alignment, font size, and font style are applied for field/text input.
+        // EXCEPTION: System font is a bitmap font and must use bitmap rendering, not native.
+        // Check the REQUESTED font name, not the loaded font. When "Arial" is requested but
+        // falls back to System bitmap, we should still use Canvas2D native with "Arial".
+        let is_system_font_requested = font_name == "System" || font_name.is_empty();
+        let force_bitmap = glyph_pref == GlyphPreference::Bitmap || glyph_pref == GlyphPreference::Outline;
+        // Force native rendering when tab stops are present — bitmap path doesn't handle tabs
+        let force_native = glyph_pref == GlyphPreference::Native || !tab_stops.is_empty();
+        let mut synthetic_spans: Option<Vec<StyledSpan>> = None;
+        let spans_for_native: Option<&Vec<StyledSpan>> = if force_bitmap && tab_stops.is_empty() {
+            // Force bitmap rendering for everything
+            None
+        } else if (force_native || !is_pfr_font || use_native_for_pfr) && !is_system_font_requested {
+            if let Some(spans) = styled_spans {
+                Some(spans)
+            } else {
+                let (r, g, b) = resolve_color_ref(
+                    &palettes,
+                    fg_color,
+                    &PaletteRef::BuiltIn(get_system_default_palette()),
+                    8,
+                );
+                let mut style = HtmlStyle::default();
+                // Use the REQUESTED font name for Canvas2D rendering, not the fallback.
+                // When "Arial" is requested but the PFR lookup falls back to System,
+                // we want Canvas2D to render with "Arial" (a real browser font).
+                style.font_face = Some(font_name.to_string());
+                style.font_size = Some(font_size as i32);
+                style.color = Some(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+                style.bold = bold;
+                style.italic = italic;
+                style.underline = underline;
+                synthetic_spans = Some(vec![StyledSpan {
+                    text: text.to_string(),
+                    style,
+                }]);
+                synthetic_spans.as_ref()
+            }
+        } else {
+            None
+        };
+
+        // Set up copy parameters for text rendering
+        // Use ink 36 (background transparent) so white pixels become transparent
+        let params = CopyPixelsParams { mask_offset: (0, 0),
+            blend,
+            ink: 36, // Background transparent - white background becomes transparent
+            color: fg_color.clone(),
+            bg_color: ColorRef::Rgb(255, 255, 255), // White background for transparency
+            mask_image: None,
+            is_text_rendering: true,
+            rotation: 0.0,
+            skew: 0.0,
+            sprite: None,
+            original_dst_rect: None,
+            bg_color_explicit: false,
+            fore_color_explicit: false,
+            ink9_mask_bitmap: None, ink9_mask_offset: (0, 0),
+            floor_rule: false,
+        };
+
+        let pfr_multi_span_styled = is_pfr_font && styled_spans.map_or(false, |s| s.len() > 1);
+
+        // Diagnostic: log the rendering path and colors
+        {
+            let span_info: String = if let Some(spans) = spans_for_native.as_ref().or(styled_spans.as_ref()) {
+                spans.iter().enumerate().map(|(i, s)| {
+                    let c = s.style.color.map(|c| format!("#{:06X}", c & 0xFFFFFF)).unwrap_or("none".into());
+                    format!("span[{}]={}", i, c)
+                }).collect::<Vec<_>>().join(", ")
+            } else { "no spans".to_string() };
+
+            if DEBUG_WEBGL2_TEXT {
+                debug!(
+                    "[render_text] font='{}' pfr={} native={} fg={:?} text='{}' spans=[{}]",
+                    font_name, is_pfr_font, spans_for_native.is_some(), fg_color,
+                    text.chars().take(30).collect::<String>(), span_info,
+                );
+            }
+        }
+
+        // Track actual content y at end of rendering. Used to trim
+        // the texture upload size so the sprite_rect grows precisely
+        // to the laid-out content (Buggy info-card with desc + 4
+        // labels) instead of the over-allocated bitmap height. None
+        // means we don't have an exact value — fall back to
+        // render_height (the bitmap size).
+        let mut content_height_actual: Option<i32> = None;
+
+        // Render text to the bitmap - use styled spans if available
+        // BUT only use native rendering if the font is NOT a PFR bitmap font
+        if let Some(spans) = spans_for_native {
+            // Parse alignment string to TextAlignment enum
+            let text_alignment: TextAlignment = alignment.into();
+
+            // For focused editable members, hand the caret/selection state to
+            // the Canvas2D renderer so it draws them with measureText positions
+            // (the bitmap font's advances would disagree with the browser font
+            // and the caret would visibly drift, especially under center/right
+            // alignment).
+            let overlay = if cache_key.has_focus {
+                Some(crate::player::handlers::datum_handlers::cast_member::font::NativeCaretOverlay {
+                    sel_start: cache_key.sel_start,
+                    sel_end: cache_key.sel_end,
+                    caret_blink_on: cache_key.caret_blink_on,
+                })
+            } else {
+                None
+            };
+
+            // Use native browser text rendering for smooth, anti-aliased text
+            // Don't pass fg_color since colors are now in the styled spans
+            if let Err(e) = FontMemberHandlers::render_native_text_to_bitmap_with_caret(
+                &mut text_bitmap,
+                spans,
+                0,  // loc_h - render at origin
+                top_spacing as i32,  // loc_v
+                width as i32,
+                height as i32,
+                text_alignment,
+                wrap_width as i32,
+                word_wrap,
+                None, // Color is in the spans
+                render_line_spacing,
+                top_spacing,
+                bottom_spacing,
+                tab_stops,
+                par_infos_for_native,
+                par_runs_for_native,
+                overlay,
+            ) {
+                web_sys::console::warn_1(
+                    &format!("WebGL2 render_text_to_texture: Native text render error: {:?}", e).into()
+                );
+            }
+        } else {
+            if DEBUG_WEBGL2_TEXT {
+                debug!(
+                    "[render_text] Using BITMAP rendering path for font='{}' text_len={}",
+                    font.font_name, text.len()
+                );
+            }
+
+            use crate::player::font::{
+                bitmap_font_copy_char, bitmap_font_copy_char_italic, bitmap_font_copy_char_scaled,
+                bitmap_font_copy_char_tight, bitmap_font_copy_char_tight_italic,
+            };
+
+            // Default line stride. The credits case (large empty-row gaps
+            // between sections) is now handled via XMED par_runs/par_infos
+            // → `per_line_spacings`, so this fallback only applies when no
+            // per-paragraph table is available — keep it as the requested
+            // point size (matches Director for FFF Reaction *, Verdana,
+            // 04b_08 * etc. on simple wrap-only members).
+            let line_height = if font.font_size > 0 {
+                font.font_size as i32
+            } else {
+                font.char_height as i32
+            };
+            // Alignment uses the full canvas width: text centered/right-
+            // aligned within the sprite display rect (e.g. 348 for Habbo's
+            // hotel-navigator help text). The wrap fold-point uses the
+            // narrower `wrap_width` (e.g. field.width = 324) — see
+            // `wrap_max_width` below. For non-field text the two are
+            // equal so behavior is unchanged.
+            let max_width = width as i32;
+            let wrap_max_width = wrap_width as i32;
+            // PFR strikes: anchor the first line so its baseline lands at the
+            // strike's true ascent (Paige: baseline = lineTop + ascent), not at
+            // top_spacing + round(outlineAscender) which sits ~2px low. The atlas
+            // scan gives cap_top (empty rows above caps within a cell); the cell's
+            // baseline_row_px overstates ascent by exactly cap_top. Director also
+            // applies top_spacing as inter-line leading, NOT before the first
+            // line, so subtract member_top_spacing too — while `top_spacing`
+            // (effective = member_top_spacing - scroll) keeps any scroll offset:
+            //   y = top_spacing - member_top_spacing - cap_top = -scroll - cap_top.
+            let (pfr_cap_top, _pfr_desc_bottom) =
+                crate::player::font::pfr_strike_vertical_metrics(&font, font_bitmap);
+            // Anchor the atlas cell top at the line top (keeping the natural
+            // ascender-to-cap gap), matching the `.image` getter's PFR anchor
+            // (`Some(_) => 0`) so on-stage field/text sprites align with baked
+            // member.image text. Previously this subtracted `cap_top` (pulling
+            // the caps onto row 0), which renders ~cap_top px too HIGH — visible
+            // once Volter login fields render from the (gap-bearing) outline atlas
+            // at 18px: the text sat 2px high. `top_spacing - member_top_spacing`
+            // equals `-scroll` (0 when unscrolled), preserving any scroll offset.
+            let mut y = match pfr_cap_top {
+                Some(_) => top_spacing as i32 - member_top_spacing as i32,
+                None => top_spacing as i32,
+            };
+            // Track max y of any glyph extent (including descender) across
+            // both styled-multi and PFR-simple paths. Used to extend
+            // `content_height_actual` so the texture trim doesn't clip
+            // descenders when char_height > line stride.
+            let mut last_glyph_bottom: i32 = 0;
+
+            // Resolve foreground color to RGB once for PFR direct copy
+            let fg_color_rgb = resolve_color_ref(
+                &palettes,
+                fg_color,
+                &PaletteRef::BuiltIn(get_system_default_palette()),
+                8,
+            );
+
+                let mut render_line = |line: &str, y_pos: i32, bitmap: &mut Bitmap| {
+                    let line_width: i32 = line
+                        .chars()
+                        .map(|c| font.get_char_advance(c as u8) as i32)
+                        .sum();
+                let start_x = match alignment {
+                    BuiltInSymbol::Center => ((max_width - line_width) / 2).max(0),
+                    BuiltInSymbol::Right => (max_width - line_width).max(0),
+                    _ => bitmap_start_x,
+                };
+
+                    let cell_has_ink = |code: u8| -> bool {
+                        if code < font.first_char_num {
+                            return false;
+                        }
+                        let idx = (code - font.first_char_num) as usize;
+                        let cx = (idx % font.grid_columns as usize) as i32;
+                        let cy = (idx / font.grid_columns as usize) as i32;
+                        let src_x =
+                            (cx * font.grid_cell_width as i32 + font.char_offset_x as i32) as i32;
+                        let src_y =
+                            (cy * font.grid_cell_height as i32 + font.char_offset_y as i32) as i32;
+                        let bmp_w = font_bitmap.width as i32;
+                        let bmp_h = font_bitmap.height as i32;
+                        for gy in 0..(font.char_height as i32) {
+                            let sy = src_y + gy;
+                            if sy < 0 || sy >= bmp_h {
+                                continue;
+                            }
+                            for gx in 0..(font.char_width as i32) {
+                                let sx = src_x + gx;
+                                if sx < 0 || sx >= bmp_w {
+                                    continue;
+                                }
+                                let p = ((sy * bmp_w + sx) * 4) as usize;
+                                if p + 3 >= font_bitmap.data.len() {
+                                    continue;
+                                }
+                                let rr = font_bitmap.data[p];
+                                let gg = font_bitmap.data[p + 1];
+                                let bb = font_bitmap.data[p + 2];
+                                let aa = font_bitmap.data[p + 3];
+                                if aa > 0 && !(rr >= 250 && gg >= 250 && bb >= 250) {
+                                    return true;
+                                }
+                            }
+                        }
+                        false
+                    };
+
+                    let mut caps_only_missing = 0;
+                    if is_pfr_font {
+                        for lc in b'a'..=b'z' {
+                            let uc = lc - 32;
+                            if !cell_has_ink(lc) && cell_has_ink(uc) {
+                                caps_only_missing += 1;
+                            }
+                        }
+                    }
+                    let force_uppercase_fallback = is_pfr_font && caps_only_missing >= 8;
+                    if DEBUG_WEBGL2_TEXT && force_uppercase_fallback {
+                        debug!(
+                            "[webgl2.text.pfr.char] caps-only fallback enabled missing_lowercase={}",
+                            caps_only_missing
+                        );
+                    }
+
+                    let mut x = start_x;
+                    let mut char_i: usize = 0;
+                    for ch in line.chars() {
+                        let adv = font.get_char_advance_for(ch) as i32;
+                        if ch == ' ' {
+                            x += adv;
+                            char_i += 1;
+                            continue;
+                        }
+
+                        // Win-1252 glyph slot for `ch` -- a plain `as u8`
+                        // truncates higher codepoints like € (U+20AC) to
+                        // the wrong byte (0xAC = ¬), so use the proper
+                        // reverse map. ASCII pass-through is preserved.
+                        let mut glyph_code = crate::io::encoding::glyph_byte_for(ch);
+                        if force_uppercase_fallback && ch.is_ascii_lowercase() {
+                            let lower = ch as u8;
+                            let upper = lower.saturating_sub(32);
+                            if cell_has_ink(upper) {
+                                glyph_code = upper;
+                                if DEBUG_WEBGL2_TEXT {
+                                    debug!(
+                                        "[webgl2.text.pfr.char] fallback '{}' ({}) -> '{}' ({})",
+                                        ch,
+                                        lower,
+                                        upper as char,
+                                        upper
+                                    );
+                                }
+                            }
+                        } else if is_pfr_font && ch.is_ascii_lowercase() {
+                            let lower = ch as u8;
+                            let upper = lower.saturating_sub(32);
+                            if !cell_has_ink(lower) && cell_has_ink(upper) {
+                                glyph_code = upper;
+                                if DEBUG_WEBGL2_TEXT {
+                                    debug!(
+                                        "[webgl2.text.pfr.char] fallback '{}' ({}) -> '{}' ({})",
+                                        ch,
+                                        lower,
+                                        upper as char,
+                                        upper
+                                    );
+                                }
+                            }
+                        }
+
+                        let use_tight_pfr = is_pfr_font && (font.char_width as i32) > (adv * 2).max(16);
+                        if DEBUG_WEBGL2_TEXT && is_pfr_font {
+                            if glyph_code >= font.first_char_num {
+                                let char_index = (glyph_code - font.first_char_num) as usize;
+                                let char_x = (char_index % font.grid_columns as usize) as u16;
+                                let char_y = (char_index / font.grid_columns as usize) as u16;
+                                let src_x =
+                                    (char_x * font.grid_cell_width + font.char_offset_x) as i32;
+                                let src_y =
+                                    (char_y * font.grid_cell_height + font.char_offset_y) as i32;
+                                debug!(
+                                    "[webgl2.text.pfr.char] i={} ch='{}' code={} adv={} dst=({}, {}) src=({}, {}) cell={}x{} glyph={}x{} first={} grid_cols={}",
+                                    char_i,
+                                    ch,
+                                    glyph_code as u32,
+                                    adv,
+                                    x,
+                                    y_pos,
+                                    src_x,
+                                    src_y,
+                                    font.grid_cell_width,
+                                    font.grid_cell_height,
+                                    font.char_width,
+                                    font.char_height,
+                                    font.first_char_num,
+                                    font.grid_columns
+                                );
+                                if use_tight_pfr {
+                                    debug!(
+                                        "[webgl2.text.pfr.char] i={} code={} using tight copy (adv={}, glyph_w={})",
+                                        char_i,
+                                        glyph_code as u32,
+                                        adv,
+                                        font.char_width
+                                    );
+                                }
+                                // Debug source glyph occupancy/bounds in the atlas cell.
+                                // This helps detect glyphs that are effectively empty or very thin.
+                                let mut ink_px: i32 = 0;
+                                let mut min_ix = font.char_width as i32;
+                                let mut max_ix = -1;
+                                let mut min_iy = font.char_height as i32;
+                                let mut max_iy = -1;
+
+                                let bmp_w = font_bitmap.width as i32;
+                                let bmp_h = font_bitmap.height as i32;
+                                for gy in 0..(font.char_height as i32) {
+                                    let sy = src_y + gy;
+                                    if sy < 0 || sy >= bmp_h {
+                                        continue;
+                                    }
+                                    for gx in 0..(font.char_width as i32) {
+                                        let sx = src_x + gx;
+                                        if sx < 0 || sx >= bmp_w {
+                                            continue;
+                                        }
+                                        let p = ((sy * bmp_w + sx) * 4) as usize;
+                                        if p + 3 >= font_bitmap.data.len() {
+                                            continue;
+                                        }
+                                        let rr = font_bitmap.data[p];
+                                        let gg = font_bitmap.data[p + 1];
+                                        let bb = font_bitmap.data[p + 2];
+                                        let aa = font_bitmap.data[p + 3];
+                                        let is_ink = aa > 0 && !(rr >= 250 && gg >= 250 && bb >= 250);
+                                        if is_ink {
+                                            ink_px += 1;
+                                            min_ix = min_ix.min(gx);
+                                            max_ix = max_ix.max(gx);
+                                            min_iy = min_iy.min(gy);
+                                            max_iy = max_iy.max(gy);
+                                        }
+                                    }
+                                }
+                                let bbox_w = if max_ix >= min_ix { max_ix - min_ix + 1 } else { 0 };
+                                let bbox_h = if max_iy >= min_iy { max_iy - min_iy + 1 } else { 0 };
+                                debug!(
+                                    "[webgl2.text.pfr.char.metrics] i={} code={} ink_px={} bbox={}x{}",
+                                    char_i, glyph_code as u32, ink_px, bbox_w, bbox_h
+                                );
+                            } else {
+                                debug!(
+                                    "[webgl2.text.pfr.char] i={} ch='{}' code={} below first_char_num={} -> skipped",
+                                    char_i,
+                                    ch,
+                                    glyph_code as u32,
+                                    font.first_char_num
+                                );
+                            }
+                        }
+                        // Each glyph is drawn exactly once, with italic and tight
+                        // variants chosen up-front. Bold uses fake double-strike
+                        // (x and x+1) since bitmap fonts don't have a separate
+                        // bold weight; italic uses per-row shear via the _italic
+                        // helpers (drawing a second sheared copy on top of the
+                        // upright one produced the doubled-glyph artifact).
+                        let draw_glyph = |dest: &mut Bitmap, dx: i32| match (italic, use_tight_pfr) {
+                            (true, true) => bitmap_font_copy_char_tight_italic(
+                                &font, font_bitmap, glyph_code, dest, dx, y_pos, &palettes, &params,
+                            ),
+                            (true, false) => bitmap_font_copy_char_italic(
+                                &font, font_bitmap, glyph_code, dest, dx, y_pos, &palettes, &params,
+                            ),
+                            (false, true) => bitmap_font_copy_char_tight(
+                                &font, font_bitmap, glyph_code, dest, dx, y_pos, &palettes, &params,
+                            ),
+                            (false, false) => bitmap_font_copy_char(
+                                &font, font_bitmap, glyph_code, dest, dx, y_pos, &palettes, &params,
+                            ),
+                        };
+                        draw_glyph(bitmap, x);
+                        if bold {
+                            draw_glyph(bitmap, x + 1);
+                        }
+                        // Apply member-level charSpacing between glyphs.
+                        // Negative tightens (FurniFactory displayComputer
+                        // uses -2). Already factored into measure_text_wrapped
+                        // so sprite_rect width matches.
+                        x += adv + char_spacing;
+                        char_i += 1;
+                    }
+
+                if underline {
+                    let (r, g, b) = resolve_color_ref(
+                        &palettes,
+                        &params.color,
+                        &PaletteRef::BuiltIn(get_system_default_palette()),
+                        8,
+                    );
+                    let underline_y = y_pos + line_height - 1;
+                    for ux in start_x..(start_x + line_width).max(start_x) {
+                        bitmap.set_pixel(ux, underline_y, (r, g, b), &palettes);
+                    }
+                }
+            };
+
+            if pfr_multi_span_styled {
+                if DEBUG_WEBGL2_TEXT {
+                    debug!(
+                        "[webgl2.text] PFR styled path spans={} line_spacing={} top_spacing={}",
+                        styled_span_count,
+                        render_line_spacing,
+                        top_spacing
+                    );
+                }
+                #[derive(Clone)]
+                struct PfrRunStyle {
+                    size_px: i32,
+                    color: ColorRef,
+                    bold: bool,
+                    italic: bool,
+                    underline: bool,
+                    /// Resolved font name for this run (e.g. "Arial",
+                    /// "Arial Bold", "Arial Italic"). Used to pick a
+                    /// variant atlas at draw time so bold/italic runs
+                    /// render from their pre-designed PFR cast members
+                    /// rather than applying fake-bold double-strike or
+                    /// fake-italic shear to the field's base atlas.
+                    font_name: Option<String>,
+                }
+
+                #[derive(Clone)]
+                struct PfrToken {
+                    text: String,
+                    is_whitespace: bool,
+                    style: PfrRunStyle,
+                }
+
+                #[derive(Clone)]
+                struct PfrLineRun {
+                    text: String,
+                    width: i32,
+                    style: PfrRunStyle,
+                }
+
+                #[derive(Default)]
+                struct PfrLine {
+                    runs: Vec<PfrLineRun>,
+                    width: i32,
+                    max_size: i32,
+                    /// Source text-line index (\r/\n separated). Used to
+                    /// look up per-line `line_spacing` from XMED par_runs.
+                    /// Wrap-induced visual lines share the previous text
+                    /// line's index (so the same line_spacing applies).
+                    text_line_idx: usize,
+                }
+
+                enum Piece {
+                    Token(PfrToken),
+                    /// Newline carries the size_px of the span that
+                    /// contained the `\r/\n` character. Used to size empty
+                    /// lines (no tokens) so they don't fall to the default
+                    /// font height — Director sources stride from the
+                    /// style covering each line's offset, including
+                    /// blank-only lines (Junkbot brick-info member 138:
+                    /// lines 4-6 are empty but reported as fontSize=12,
+                    /// lines 9-11 empty reported as fontSize=6).
+                    Newline(i32),
+                }
+
+                let fallback_color = fg_color.clone();
+                let base_size = font_size.max(1) as i32;
+                let native_char_height = font.char_height.max(1) as i32;
+
+                let color_from_style = |style: &HtmlStyle| -> ColorRef {
+                    if let Some(c) = style.color {
+                        ColorRef::Rgb(
+                            ((c >> 16) & 0xFF) as u8,
+                            ((c >> 8) & 0xFF) as u8,
+                            (c & 0xFF) as u8,
+                        )
+                    } else {
+                        fallback_color.clone()
+                    }
+                };
+
+                let style_from_span = |style: &HtmlStyle| -> PfrRunStyle {
+                    PfrRunStyle {
+                        size_px: style.font_size.unwrap_or(base_size).max(1),
+                        color: color_from_style(style),
+                        bold: style.bold,
+                        italic: style.italic,
+                        underline: style.underline,
+                        font_name: style.font_face.clone(),
+                    }
+                };
+
+                // Minimum space-character advance. Some PFR1 fonts ship
+                // a space `set_width` so narrow that at small render sizes
+                // (12 pt) the advance rounds to 1–2 px and text wraps way
+                // later than Shockwave's reference — extra words squeeze
+                // onto each line. Shockwave's authentic render of these
+                // movies uses what looks like GDI's default Arial space
+                // (~30% em). 0.30 × size_px ≈ 4 px at 12 pt — within a
+                // half-pixel of Windows Arial's space metric. Clamps
+                // only spaces; non-space glyph advances are untouched.
+                let space_min_advance = |size_px: i32| -> i32 {
+                    ((size_px as f32 * 0.30).round() as i32).max(2)
+                };
+                // Pre-load variant atlases for every distinct `font_face`
+                // referenced by the styled spans (Arial, Arial Bold, Arial
+                // Italic, …). The map is used twice: by `token_width` below
+                // to compute WRAP-time widths with the same per-run atlas
+                // the draw uses, AND by the per-line draw loop further down.
+                // Doing wrap measurement with regular Arial while drawing
+                // with Arial Bold made the rendered bold text overflow the
+                // wrap boundary, which then made `the mouseChar` resolve
+                // clicks on visual "Christ's passion" to char positions
+                // deep inside "the sign of the cross" / "three motives".
+                struct PfrWrapVariant {
+                    font: std::rc::Rc<crate::player::font::BitmapFont>,
+                }
+                let mut wrap_variants: std::collections::HashMap<String, PfrWrapVariant> = std::collections::HashMap::new();
+                {
+                    let mut unique_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    if let Some(spans) = styled_spans {
+                        for span in spans {
+                            if let Some(ref name) = span.style.font_face {
+                                if !name.is_empty() && !name.eq_ignore_ascii_case(font_name) {
+                                    unique_names.insert(name.clone());
+                                }
+                            }
+                        }
+                    }
+                    for variant_name in unique_names {
+                        if let Some(vf) = player.font_manager.get_font_with_cast_and_bitmap(
+                            &variant_name,
+                            &player.movie.cast_manager,
+                            &mut player.bitmap_manager,
+                            Some(requested_font_size),
+                            None,
+                        ) {
+                            if vf.char_widths.is_some() {
+                                wrap_variants.insert(
+                                    variant_name.to_ascii_lowercase(),
+                                    PfrWrapVariant { font: vf },
+                                );
+                            }
+                        }
+                    }
+                }
+                let token_width = |token_text: &str, style: &PfrRunStyle| -> i32 {
+                    let scale_num = style.size_px.max(1);
+                    let scale_den = base_size.max(1);
+                    let space_min = space_min_advance(style.size_px);
+                    // Pick the run's variant atlas font for wrap-time
+                    // advances when available, so wrap widths match the
+                    // per-span draw widths.
+                    let variant_font = style.font_name.as_ref()
+                        .and_then(|n| wrap_variants.get(&n.to_ascii_lowercase()))
+                        .map(|v| &*v.font);
+                    let measure_font = variant_font.unwrap_or(&*font);
+                    token_text
+                        .chars()
+                        .map(|c| {
+                            let raw = ((measure_font.get_char_advance(c as u8) as i32) * scale_num / scale_den)
+                                .max(1);
+                            if c == ' ' { raw.max(space_min) } else { raw }
+                        })
+                        .sum()
+                };
+
+                let mut pieces: Vec<Piece> = Vec::new();
+                if let Some(spans) = styled_spans {
+                    for span in spans {
+                        if span.text.is_empty() {
+                            continue;
+                        }
+                        let run_style = style_from_span(&span.style);
+                        let mut token = String::new();
+                        let mut token_is_ws: Option<bool> = None;
+
+                        for ch in span.text.chars() {
+                            if ch == '\r' || ch == '\n' {
+                                if !token.is_empty() {
+                                    pieces.push(Piece::Token(PfrToken {
+                                        text: std::mem::take(&mut token),
+                                        is_whitespace: token_is_ws.unwrap_or(false),
+                                        style: run_style.clone(),
+                                    }));
+                                    token_is_ws = None;
+                                }
+                                pieces.push(Piece::Newline(run_style.size_px));
+                                continue;
+                            }
+
+                            let is_ws = ch.is_whitespace();
+                            if token_is_ws != Some(is_ws) && !token.is_empty() {
+                                pieces.push(Piece::Token(PfrToken {
+                                    text: std::mem::take(&mut token),
+                                    is_whitespace: token_is_ws.unwrap_or(false),
+                                    style: run_style.clone(),
+                                }));
+                            }
+                            token_is_ws = Some(is_ws);
+                            token.push(ch);
+                        }
+
+                        if !token.is_empty() {
+                            pieces.push(Piece::Token(PfrToken {
+                                text: token,
+                                is_whitespace: token_is_ws.unwrap_or(false),
+                                style: run_style.clone(),
+                            }));
+                        }
+                    }
+                }
+
+                let mut lines: Vec<PfrLine> = Vec::new();
+                let mut current_line = PfrLine::default();
+                let mut current_text_line_idx: usize = 0;
+
+                let push_line = |line: &mut PfrLine,
+                                 lines_out: &mut Vec<PfrLine>,
+                                 next_text_line_idx: usize| {
+                    lines_out.push(std::mem::take(line));
+                    line.text_line_idx = next_text_line_idx;
+                };
+
+                for piece in pieces {
+                    match piece {
+                        Piece::Newline(size_px) => {
+                            // Apply the newline's span size to the line
+                            // being closed so empty lines (no tokens) carry
+                            // the right max_size for stride computation.
+                            if current_line.runs.is_empty() {
+                                current_line.max_size = current_line.max_size.max(size_px);
+                            }
+                            current_text_line_idx += 1;
+                            push_line(&mut current_line, &mut lines, current_text_line_idx);
+                        }
+                        Piece::Token(token) => {
+                            let width = token_width(&token.text, &token.style);
+                            if word_wrap
+                                && wrap_max_width > 0
+                                && !token.is_whitespace
+                                && !current_line.runs.is_empty()
+                                && (current_line.width + width > wrap_max_width)
+                            {
+                                // Wrap-induced break: the next visual line
+                                // is still the same text-line, so don't
+                                // increment text_line_idx.
+                                push_line(&mut current_line, &mut lines, current_text_line_idx);
+                            }
+
+                            if token.is_whitespace && current_line.runs.is_empty() {
+                                continue;
+                            }
+
+                            current_line.width += width;
+                            current_line.max_size = current_line.max_size.max(token.style.size_px);
+                            current_line.runs.push(PfrLineRun {
+                                text: token.text,
+                                width,
+                                style: token.style,
+                            });
+                        }
+                    }
+                }
+
+                if !current_line.runs.is_empty() || lines.is_empty() {
+                    lines.push(current_line);
+                }
+
+                if DEBUG_WEBGL2_TEXT {
+                    let line_count = lines.len();
+                    let max_line_width = lines.iter().map(|l| l.width).max().unwrap_or(0);
+                    debug!(
+                        "[webgl2.text.pfr.styled] lines={} max_line_width={} box={}x{} y_start={} line_h={} spacing={} wrap={}",
+                        line_count,
+                        max_line_width,
+                        render_width,
+                        render_height,
+                        y,
+                        line_height,
+                        render_line_spacing,
+                        word_wrap
+                    );
+                }
+
+                // Pre-load every variant atlas referenced by the styled
+                // spans (typically "Arial" / "Arial Bold" / "Arial Italic"
+                // for Fugue No. 4's Narrative field). Cloning the bitmap
+                // up-front sidesteps the borrow-checker conflict between
+                // looking up `player.bitmap_manager` for the source atlas
+                // while the destination text_bitmap is being mutated, and
+                // means we only need the `&Bitmap` reference inside the
+                // per-glyph draw call. ~88KB per variant × ~4 variants
+                // = ~350KB per cache miss; cached afterwards.
+                struct PfrVariantAtlas {
+                    font: std::rc::Rc<crate::player::font::BitmapFont>,
+                    bitmap: Bitmap,
+                }
+                let mut variant_atlases: std::collections::HashMap<String, PfrVariantAtlas> = std::collections::HashMap::new();
+                {
+                    let mut unique_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for line in &lines {
+                        for run in &line.runs {
+                            if let Some(ref name) = run.style.font_name {
+                                if !name.is_empty() && !name.eq_ignore_ascii_case(font_name) {
+                                    unique_names.insert(name.clone());
+                                }
+                            }
+                        }
+                    }
+                    for variant_name in unique_names {
+                        if let Some(variant_font) = player.font_manager.get_font_with_cast_and_bitmap(
+                            &variant_name,
+                            &player.movie.cast_manager,
+                            &mut player.bitmap_manager,
+                            Some(requested_font_size),
+                            None,
+                        ) {
+                            if variant_font.char_widths.is_some() {
+                                if let Some(bmp) = player.bitmap_manager.get_bitmap(variant_font.bitmap_ref) {
+                                    variant_atlases.insert(
+                                        variant_name.to_ascii_lowercase(),
+                                        PfrVariantAtlas { font: variant_font.clone(), bitmap: bmp.clone() },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if DEBUG_WEBGL2_TEXT {
+                        debug!(
+                            "[webgl2.text.pfr.variants] base='{}' variants_loaded={}",
+                            font_name,
+                            variant_atlases.len()
+                        );
+                    }
+                }
+
+                // Paragraph-boundary spacing rule (XMED-verified against
+                // Buggy info-card):
+                //
+                // At a par_info transition where BOTH the outgoing and
+                // incoming paragraphs have an explicit `line_spacing >
+                // font_size`, insert a virtual blank line equal to
+                // `max(prev_ls, this_ls)` — Director's interpretation
+                // of "tall paragraphs separated by tall paragraphs"
+                // adds an extra line-height of vertical space, which is
+                // the visible gap between Buggy's description (sl=14)
+                // and "Terrain: Normal" (sl=15). When the next
+                // paragraph drops below font height (e.g. labels with
+                // sl=5, clamped to font for rendering), no boundary
+                // spacing is added so consecutive labeled rows remain
+                // tightly stacked.
+                //
+                // Per-paragraph `\sa`/`\sb` from par_info still stack
+                // on top when authored (zero for Buggy but preserved
+                // for forward compatibility with other members).
+                // Boundary spacing fires at par_info transitions
+                // where BOTH adjacent paragraphs have an explicit
+                // `line_spacing > font_size` (the "tall→tall" rule).
+                // For Buggy: only desc(14)→Terrain(15) triggers the
+                // 10pt gap; Terrain→labels(5) and within-labels stay
+                // tight. Per-par_info `\sa`/`\sb` stack when authored
+                // (zero for Buggy).
+                let mut prev_par_idx_pfr: Option<u16> = None;
+                for line in lines {
+                    let this_par_idx = per_line_par_idx
+                        .get(line.text_line_idx)
+                        .copied();
+                    if let (Some(prev), Some(this)) = (prev_par_idx_pfr, this_par_idx) {
+                        if prev != this {
+                            let prev_pi = par_infos_for_native.get(prev as usize);
+                            let this_pi = par_infos_for_native.get(this as usize);
+                            let prev_ls = prev_pi.map(|pi| pi.line_spacing).unwrap_or(0);
+                            let this_ls = this_pi.map(|pi| pi.line_spacing).unwrap_or(0);
+                            let font = line.max_size.max(12);
+                            if prev_ls > font && this_ls > font {
+                                y += bottom_spacing as i32 + top_spacing as i32;
+                            }
+                            let prev_sa = prev_pi.map(|pi| pi.bottom_spacing).unwrap_or(0);
+                            let this_sb = this_pi.map(|pi| pi.top_spacing).unwrap_or(0);
+                            y += prev_sa + this_sb;
+                        }
+                    }
+                    prev_par_idx_pfr = this_par_idx;
+
+                    let start_x = match alignment {
+                        BuiltInSymbol::Center => ((max_width - line.width) / 2).max(0),
+                        BuiltInSymbol::Right => (max_width - line.width).max(0),
+                        _ => bitmap_start_x,
+                    };
+
+                    let mut x = start_x;
+                    for run in line.runs {
+                        let mut run_params = CopyPixelsParams {
+                            blend: params.blend,
+                            ink: params.ink,
+                            color: run.style.color.clone(),
+                            bg_color: params.bg_color.clone(),
+                            mask_image: None,
+                            is_text_rendering: params.is_text_rendering,
+                            rotation: params.rotation,
+                            skew: params.skew,
+                            sprite: None,
+                            mask_offset: (0, 0),
+                            original_dst_rect: params.original_dst_rect.clone(),
+                            bg_color_explicit: false,
+                            fore_color_explicit: false,
+                            ink9_mask_bitmap: None, ink9_mask_offset: (0, 0),
+                            floor_rule: false,
+                        };
+
+                        // Pick the run's atlas. When the run names a variant
+                        // we've pre-loaded (e.g. "Arial Bold" or "Arial
+                        // Italic" cast members in Fugue No. 4), draw the
+                        // glyphs directly from that atlas — the variant
+                        // PFR1 already encodes bold/italic stroke shapes,
+                        // so no double-strike or shear is needed. Falling
+                        // back to the field's base atlas means we apply
+                        // the legacy fake-bold / fake-italic transforms.
+                        let run_variant = run.style.font_name.as_ref()
+                            .and_then(|n| variant_atlases.get(&n.to_ascii_lowercase()));
+                        let (run_font, run_font_bitmap, use_variant) = match run_variant {
+                            Some(v) => (&*v.font as &crate::player::font::BitmapFont, &v.bitmap, true),
+                            None => (&*font, font_bitmap, false),
+                        };
+                        let run_native_char_h = run_font.char_height.max(1) as i32;
+                        let run_native_char_w = run_font.char_width as i32;
+                        let span_scale_num = run.style.size_px.max(1);
+                        let span_scale_den = base_size.max(1);
+                        let char_h = (run_native_char_h * span_scale_num / span_scale_den).max(1);
+                        let char_w =
+                            (run_native_char_w * span_scale_num / span_scale_den).max(1);
+                        let span_is_default_size = span_scale_num == span_scale_den;
+                        // When drawing from a pre-designed variant atlas
+                        // (Arial Bold / Italic), the style is already in
+                        // the glyph shapes — suppress fake-bold and
+                        // fake-italic so we don't stack them on top.
+                        let apply_fake_bold = run.style.bold && !use_variant;
+                        let apply_fake_italic = run.style.italic && !use_variant;
+                        let italic_default_size = apply_fake_italic && span_is_default_size;
+                        let underline_y = y + char_h - 1;
+                        let run_start_x = x;
+
+                        let space_min = space_min_advance(run.style.size_px);
+                        for ch in run.text.chars() {
+                            let glyph_b = crate::io::encoding::glyph_byte_for(ch);
+                            let raw_advance = if span_is_default_size {
+                                run_font.get_char_advance(glyph_b) as i32
+                            } else {
+                                ((run_font.get_char_advance(glyph_b) as i32) * span_scale_num / span_scale_den)
+                                    .max(1)
+                            };
+                            // Mirror the wrap-time clamp: spaces with a tiny
+                            // stored set_width get widened to ≥ font_size/4 so
+                            // word advance matches measurement and lines wrap
+                            // where we said they would.
+                            let advance = if ch == ' ' {
+                                raw_advance.max(space_min)
+                            } else {
+                                raw_advance
+                            };
+
+                            if ch == ' ' {
+                                x += advance;
+                                continue;
+                            }
+
+                            let draw_glyph = |dest: &mut Bitmap, dx: i32| {
+                                if italic_default_size {
+                                    bitmap_font_copy_char_italic(
+                                        run_font, run_font_bitmap, glyph_b, dest, dx, y, &palettes, &run_params,
+                                    );
+                                } else if span_is_default_size {
+                                    bitmap_font_copy_char(
+                                        run_font, run_font_bitmap, glyph_b, dest, dx, y, &palettes, &run_params,
+                                    );
+                                } else {
+                                    bitmap_font_copy_char_scaled(
+                                        run_font, run_font_bitmap, glyph_b, dest, dx, y,
+                                        char_w, char_h, &palettes, &run_params,
+                                    );
+                                }
+                            };
+                            draw_glyph(&mut text_bitmap, x);
+                            if apply_fake_bold {
+                                draw_glyph(&mut text_bitmap, x + 1);
+                            }
+
+                            x += advance;
+                        }
+
+                        if run.style.underline && underline_y >= 0 && underline_y < text_bitmap.height as i32 {
+                            let (r, g, b) = resolve_color_ref(
+                                &palettes,
+                                &run_params.color,
+                                &PaletteRef::BuiltIn(get_system_default_palette()),
+                                8,
+                            );
+                            for ux in run_start_x..x {
+                                text_bitmap.set_pixel(ux, underline_y, (r, g, b), &palettes);
+                            }
+                        }
+                    }
+
+                    // Per-line line_spacing override (XMED par_runs/par_infos).
+                    // Priority:
+                    //   1. Explicit `per_line_spacings` entry from par_info
+                    //      (Junkbot help member 124: 14 for size-12 titles,
+                    //      9 for size-6 body, 15/17/10 for gap pars).
+                    //   2. The line's dominant span size — when par_info
+                    //      `dword270` is 0 across the member (all
+                    //      "fixedLineSpace=0" in Director's chunk dump),
+                    //      Director uses each line's font_size as the
+                    //      stride. Junkbot brick-info member 138: 17×12 +
+                    //      21×6 = 330 = member.height exactly. Without
+                    //      this branch we'd fall to render_line_spacing
+                    //      (single member-level value) and ~7 lines worth
+                    //      of content overflow off the bottom.
+                    //   3. `render_line_spacing` (member.fixedLineSpace).
+                    //   4. `line_height` (font default).
+                    //
+                    // The per-line spacing is then clamped up to
+                    // `line.max_size` so an authored small `line_spacing`
+                    // (e.g. Buggy labels' `par_info.line_spacing = 5` from
+                    // Director's `\sl100`) doesn't force lines to overlap
+                    // their own 12pt content. Director appears to treat
+                    // small `\sl` values as a minimum, not a literal line
+                    // height.
+                    // par_info `line_spacing` is the line cell height
+                    // (Paige `leading_variable`: a minimum). When the
+                    // authored value is at least the font's natural
+                    // cell height (`native_char_height`, derived from
+                    // the PFR font's `char_height`), it wins —
+                    // description (14) and "Terrain: Normal" (15)
+                    // honor their authored stride. When the value is
+                    // below the font cell (Buggy labels' sl=5 vs PFR
+                    // Arial *'s 17pt cell), it would force glyph
+                    // overlap, so we clamp up to `native_char_height`
+                    // — Director's auto-fallback per the
+                    // `fixedLineSpace` docs.
+                    let per_line_spacing = per_line_spacings
+                        .get(line.text_line_idx)
+                        .copied()
+                        .filter(|&s| s > 0)
+                        .map(|s| {
+                            // When authored line_spacing meets/exceeds
+                            // the font size, honor it verbatim
+                            // (description=14, Terrain=15). When it
+                            // falls below the font (label paragraphs
+                            // with sl=5), Director's auto-fallback
+                            // gives the line ascent+descent — roughly
+                            // `font_size × 1.25` for typical fonts
+                            // (15pt for a 12pt font). The PFR
+                            // `native_char_height` is taller than
+                            // this (17pt for Arial *) because it
+                            // includes the cell's natural leading,
+                            // which Director doesn't add at this
+                            // step.
+                            //
+                            // EMPTY lines (no rendered glyphs, line.width
+                            // == 0) skip the clamp entirely: there's no
+                            // glyph to overlap, and Director uses the
+                            // small authored value as-is for blank lines
+                            // — used in Junkbot v1 brick-info member 139
+                            // where par_info[2] sets line_spacing=6 on
+                            // the empty paragraph before "eyeBOT" so the
+                            // gap above the label is tighter than the
+                            // surrounding 12pt empty rows.
+                            let s = s as i32;
+                            if line.width == 0 {
+                                s.max(0) as u16
+                            } else if s < line.max_size {
+                                let auto_cell = line.max_size + line.max_size / 4;
+                                auto_cell.max(line.max_size).max(0) as u16
+                            } else {
+                                s.max(line.max_size).max(0) as u16
+                            }
+                        });
+                    // Per-line fallback when THIS line's par_info dword270
+                    // is 0. Priority:
+                    //   1. `render_line_spacing` (member-level fixedLineSpace).
+                    //      Junkbot hint_text member 174 has member.fixedLineSpace=17,
+                    //      par_info[0].line_spacing=0; Director strides every
+                    //      line at 17. Without this branch the body falls to
+                    //      max_size=12 and the laid-out content shrinks below
+                    //      Director's 6-row authored layout.
+                    //   2. `line.max_size` (line's dominant span size).
+                    //      Junkbot brick info members 138/139 have member-level
+                    //      fixedLineSpace=0 and per-line par_info=0; Director
+                    //      strides each line at its font_size (12 for titles,
+                    //      6 for body).
+                    //   3. `line_height` (font default).
+                    let effective_lh = per_line_spacing
+                        .map(|s| s as i32)
+                        .unwrap_or_else(|| {
+                            if render_line_spacing > 0 {
+                                render_line_spacing as i32
+                            } else if line.max_size > 0 {
+                                line.max_size
+                            } else {
+                                line_height
+                            }
+                        });
+                    // top/bottom_spacing are PER-PARAGRAPH (member-level),
+                    // applied above at source-paragraph transitions —
+                    // intentionally NOT per-line here.
+                    let line_step = effective_lh;
+                    if DEBUG_WEBGL2_TEXT {
+                        debug!(
+                            "[webgl2.text.pfr.styled] line width={} start_x={} y={} step={} next_y={}",
+                            line.width,
+                            start_x,
+                            y,
+                            line_step,
+                            y + line_step
+                        );
+                    }
+                    y += line_step;
+                }
+            } else {
+                // Use the same wrap algorithm the caret/selection math uses
+                // (Bitmap::wrap_lines_with_spans). Otherwise per-line widths
+                // diverge by a few pixels — most visible under center/right
+                // alignment, where the per-line offset is (width - line_w)/2
+                // and any line_w mismatch shifts the rendered text relative
+                // to the caret.
+                let wrap_w = if word_wrap && max_width > 0 { max_width } else { 0 };
+                let spans = Bitmap::wrap_lines_with_spans(text, &font, wrap_w);
+                // Map each visual line back to its source paragraph index for
+                // per_line_spacings lookup.
+                let lines_to_draw: Vec<String> = spans.iter().map(|s| s.text.clone()).collect();
+                let mut line_text_indices: Vec<usize> = Vec::with_capacity(spans.len());
+                {
+                    // Source paragraph index = number of \r or \n characters
+                    // strictly before the line's start byte offset.
+                    let bytes = text.as_bytes();
+                    for s in &spans {
+                        let para_idx = bytes[..s.start.min(bytes.len())]
+                            .iter()
+                            .filter(|b| **b == b'\r' || **b == b'\n')
+                            .count();
+                        line_text_indices.push(para_idx);
+                    }
+                }
+
+                if DEBUG_WEBGL2_TEXT {
+                    let max_line_width = lines_to_draw
+                        .iter()
+                        .map(|line| {
+                            line.chars()
+                                .map(|c| font.get_char_advance(c as u8) as i32)
+                                .sum::<i32>()
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    debug!(
+                        "[webgl2.text.bitmap] lines={} max_line_width={} box={}x{} y_start={} line_h={} spacing={} wrap={} align='{}'",
+                        lines_to_draw.len(),
+                        max_line_width,
+                        render_width,
+                        render_height,
+                        y,
+                        line_height,
+                        render_line_spacing,
+                        word_wrap,
+                        alignment
+                    );
+                }
+
+                for (vis_idx, line) in lines_to_draw.iter().enumerate() {
+                    if DEBUG_WEBGL2_TEXT {
+                        let line_width: i32 = line.chars().map(|c| font.get_char_advance(c as u8) as i32).sum();
+                        debug!(
+                            "[webgl2.text.bitmap] draw line_w={} y={} text='{}'",
+                            line_width,
+                            y,
+                            line.chars().take(60).collect::<String>()
+                        );
+                    }
+                    // Per-line line_spacing override (XMED par_runs/par_infos).
+                    // Wrap-induced visual lines reuse the source text-line's
+                    // entry. Falls back to render_line_spacing/line_height
+                    // when no per-line table or when the entry is 0.
+                    let per_line_spacing = line_text_indices
+                        .get(vis_idx)
+                        .and_then(|src_idx| per_line_spacings.get(*src_idx))
+                        .copied()
+                        .filter(|&s| s > 0);
+                    let effective_lh = per_line_spacing
+                        .map(|s| s as i32)
+                        .unwrap_or_else(|| {
+                            if render_line_spacing > 0 {
+                                render_line_spacing as i32
+                            } else {
+                                line_height
+                            }
+                        });
+                    // Director-style leading: when the line cell is taller
+                    // than the glyph cell (effective_lh > native char_height),
+                    // the extra space is leading at the TOP of the line. The
+                    // glyph baseline sits in the lower portion of the cell —
+                    // not flush against the top. This matches Junkbot v1
+                    // level.num where each line is 21 px but the 04b_08 *
+                    // glyphs are only ~16 px tall: Director draws the "1"
+                    // ~5 px below the cell top, so the visible text rows
+                    // sit "inside" each row rather than crowding the top.
+                    let glyph_cell_h = if font.font_size > 0 {
+                        font.font_size as i32
+                    } else {
+                        font.char_height as i32
+                    };
+                    let leading_top = (effective_lh - glyph_cell_h).max(0);
+                    render_line(line, y + leading_top, &mut text_bitmap);
+                    // Track the max glyph extent (including descender). The
+                    // PFR atlas's `font.char_height` includes ascender +
+                    // descender, but `effective_lh` (line stride) is often
+                    // capped to the requested `font_size` which excludes
+                    // the descender. Without this, the texture trim at
+                    // `content_height_actual = y + line_step` clips the
+                    // descender of letters like 'g', 'p', 'y' on the LAST
+                    // line — visible on Worldbuilder Tugboat title (Arial
+                    // Black 25pt: char_height ~31, line_step 25, "Tugboat"
+                    // 'g' descender extended to ~31 but trim was at 25).
+                    let glyph_bottom = y + leading_top + font.char_height as i32;
+                    last_glyph_bottom = last_glyph_bottom.max(glyph_bottom);
+                    // Per-line stride is the font height + bottom_spacing.
+                    // top_spacing is the initial padding before the first
+                    // line — it's already baked into the starting `y`, so
+                    // adding it to the per-line step would stack extra
+                    // space between every line (visible as "Enter creates
+                    // a new line way below the previous one").
+                    let line_step = effective_lh + bottom_spacing as i32;
+                    if DEBUG_WEBGL2_TEXT && is_pfr_font {
+                        debug!(
+                            "[webgl2.text.pfr.simple] step={} next_y={} h={}",
+                            line_step,
+                            y + line_step,
+                            render_height
+                        );
+                    }
+                    y += line_step;
+                }
+            }
+            // Capture the final y so the bitmap can be trimmed to
+            // exactly the laid-out content height (sprite_rect grows
+            // to fit the actual rendered text rather than the
+            // pre-allocated padding budget). Take max with the actual
+            // glyph extent (including descender) so trim doesn't clip
+            // 'g'/'p'/'y' descenders on the last line when char_height
+            // exceeds the line stride (Worldbuilder Tugboat title at
+            // Arial Black 25pt).
+            content_height_actual = Some(y.max(last_glyph_bottom));
+        }
+
+        // Resolve the bg_color to RGB. The caller already picks the correct source:
+        // member bgColor (from XMED Section 0x0000) with sprite bgColor as fallback.
+        let bg_rgb = resolve_color_ref(
+            &palettes,
+            bg_color,
+            &PaletteRef::BuiltIn(get_system_default_palette()),
+            8,
+        );
+        // Only ink 0 (Copy) paints the member's opaque background. Every other
+        // ink lets the background fall through (relying on the text bitmap's
+        // alpha=0 background / alpha>0 glyphs), which is exactly what the
+        // comment below already documents: ink 0 = bg drawn, otherwise not.
+        //
+        // The previous `!is_transparency_ink` heuristic only excluded a small
+        // set (3,7,8,9,36) and so force-filled an opaque white box under every
+        // other ink — including ink 4 (NotCopy), which spectral-wizard's HELP
+        // title uses for its drop shadow: the same cream `help_header` member,
+        // NotCopy-inverted to black and offset behind the cream copy. The
+        // bogus white fill from the shadow sprite covered the whole title.
+        // (Transparent/Reverse/blend inks on text were similarly wrong.)
+        //
+        // White bg fields use ink 36 (BgTransparent) when the author wants the
+        // bg to fall through (e.g. text/field members over a 3D scene). Coke
+        // Studios' `nav_vego_search_field` v-ego search box uses ink 0 Copy and
+        // needs its white bg drawn — preserved here.
+        let has_bg_fill = ink == 0;
+
+        // After drawing text, handle background pixels.
+        // The bitmap was pre-filled with alpha=0 (transparent).
+        // Both Canvas2D and PFR rendering write text pixels with alpha>0.
+        // Background = alpha==0 (never written to by either renderer).
+        //
+        // For anti-aliased text, Canvas2D produces edge pixels with alpha 1-254
+        // composited against transparent black. When has_bg_fill is active, these
+        // semi-transparent pixels need to be blended against the background color
+        // and made fully opaque, otherwise the stage color bleeds through.
+        for i in 0..text_bitmap.data.len() / 4 {
+            let a = text_bitmap.data[i * 4 + 3];
+
+            if a == 0 {
+                // Background pixel - either fill with bg color or leave transparent
+                if has_bg_fill {
+                    text_bitmap.data[i * 4] = bg_rgb.0;
+                    text_bitmap.data[i * 4 + 1] = bg_rgb.1;
+                    text_bitmap.data[i * 4 + 2] = bg_rgb.2;
+                    text_bitmap.data[i * 4 + 3] = 255; // Fully opaque
+                }
+                // else: already alpha=0 (transparent), nothing to do
+            } else if has_bg_fill && a < 255 {
+                // Anti-aliased edge pixel: blend text color with background color.
+                // Canvas2D composited against transparent black, so we need to
+                // re-composite against the actual background color.
+                let alpha = a as u32;
+                let inv_alpha = 255 - alpha;
+                let r = text_bitmap.data[i * 4] as u32;
+                let g = text_bitmap.data[i * 4 + 1] as u32;
+                let b = text_bitmap.data[i * 4 + 2] as u32;
+                text_bitmap.data[i * 4]     = ((r * alpha + bg_rgb.0 as u32 * inv_alpha) / 255) as u8;
+                text_bitmap.data[i * 4 + 1] = ((g * alpha + bg_rgb.1 as u32 * inv_alpha) / 255) as u8;
+                text_bitmap.data[i * 4 + 2] = ((b * alpha + bg_rgb.2 as u32 * inv_alpha) / 255) as u8;
+                text_bitmap.data[i * 4 + 3] = 255; // Fully opaque
+            }
+        }
+
+        // Render selection highlight + caret when the field has focus.
+        // The cache key already includes sel_start/sel_end and the blink phase,
+        // so this draws into a fresh texture entry whenever any of those move.
+        // Skip when the Canvas2D path already drew them (it has access to the
+        // browser's measureText, which we can't replicate from BitmapFont
+        // metrics here).
+        let caret_drawn_by_native = spans_for_native.is_some();
+        if cache_key.has_focus && !caret_drawn_by_native {
+            let sel_lo = cache_key.sel_start.min(cache_key.sel_end).max(0);
+            let sel_hi = cache_key.sel_start.max(cache_key.sel_end).max(0);
+            let has_selection = sel_lo != sel_hi;
+            // The render_line closure inside this function computes per-line
+            // alignment using the box width (`max_width`) for both wrap and
+            // non-wrap paths when alignment is center/right (`bitmap_start_x`
+            // is only used as the fallback for left alignment). To agree
+            // pixel-for-pixel, our caret math must do the same: pass the box
+            // width in unconditionally so caret_index_to_xy produces the
+            // per-line alignment offset itself, and we don't add
+            // `bitmap_start_x` on top — that would double-count alignment.
+            let caret_max_width = width as i32;
+            // Match the per-line stride render_line uses below: effective_lh
+            // (= render_line_spacing if > 0 else line_height) + bottom_spacing.
+            // Without this the caret y drifts away from the rendered glyphs as
+            // soon as render_line_spacing is non-zero or the font defines a
+            // distinct font_size vs. char_height.
+            let renderer_line_h: i32 = {
+                let lh = if font.font_size > 0 { font.font_size as i32 } else { font.char_height as i32 };
+                let effective_lh = if render_line_spacing > 0 { render_line_spacing as i32 } else { lh };
+                effective_lh + bottom_spacing as i32
+            };
+
+            if has_selection {
+                let lines = Bitmap::wrap_lines_with_spans(text, &font, caret_max_width);
+                let line_h = renderer_line_h;
+                let lo = sel_lo as usize;
+                let hi = sel_hi as usize;
+                let text_alignment: TextAlignment = alignment.into();
+                for (i, line) in lines.iter().enumerate() {
+                    if hi <= line.start || (lo >= line.end && line.start != line.end) {
+                        continue;
+                    }
+                    let from = lo.max(line.start);
+                    let to = hi.min(line.end);
+                    if from > to { continue; }
+                    // Compute x positions inline for THIS line, instead of
+                    // delegating to caret_index_to_xy. The helper preferentially
+                    // returns the start of the next line for byte indices that
+                    // sit at a soft-wrap boundary, which makes a multi-line
+                    // selection's right edge on line N collapse onto line N+1.
+                    // Walk chars, not bytes. Each visible character is one
+                    // glyph advance regardless of UTF-8 byte length; the
+                    // earlier byte-iteration variant gave umlauts 2x width
+                    // and stretched the selection-highlight past the end
+                    // of the actual text.
+                    let line_w: i32 = line.text.chars()
+                        .map(|c| font.get_char_advance_for(c) as i32)
+                        .sum();
+                    let x_offset: i32 = if caret_max_width > 0 {
+                        match text_alignment {
+                            TextAlignment::Center => ((caret_max_width - line_w) / 2).max(0),
+                            TextAlignment::Right => (caret_max_width - line_w).max(0),
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+                    let advance_for = |start: usize, end: usize| -> i32 {
+                        let mut s = start.saturating_sub(line.start).min(line.text.len());
+                        let mut e = end.saturating_sub(line.start).min(line.text.len());
+                        while s < line.text.len() && !line.text.is_char_boundary(s) { s += 1; }
+                        while e < line.text.len() && !line.text.is_char_boundary(e) { e += 1; }
+                        if e < s { return 0; }
+                        line.text[s..e]
+                            .chars()
+                            .map(|c| font.get_char_advance_for(c) as i32)
+                            .sum()
+                    };
+                    let mut left = x_offset + advance_for(line.start, from);
+                    let mut right = x_offset + advance_for(line.start, to);
+                    // Selection that continues into the next visual line — show a
+                    // trailing space's worth so the highlight visibly bridges
+                    // wrapped lines instead of stopping mid-air.
+                    if right == left && hi > line.end {
+                        right += font.get_char_advance(b' ') as i32;
+                    }
+                    if right < left { std::mem::swap(&mut left, &mut right); }
+                    let y = top_spacing as i32 + (i as i32) * line_h;
+                    // Composite the selection BEHIND the already-rasterized
+                    // text glyphs (same approach as the Canvas2D path) so the
+                    // text reads on top of the highlight instead of being
+                    // tinted by a translucent overlay.
+                    let bottom = y + font.char_height as i32;
+                    let bw = text_bitmap.width as i32;
+                    let bh = text_bitmap.height as i32;
+                    let l = left.max(0);
+                    let r = right.min(bw);
+                    let t = y.max(0);
+                    let b = bottom.min(bh);
+                    for py in t..b {
+                        for px in l..r {
+                            let idx = ((py as usize) * bw as usize + px as usize) * 4;
+                            if idx + 3 >= text_bitmap.data.len() { continue; }
+                            let a = text_bitmap.data[idx + 3] as u32;
+                            if a == 0 {
+                                text_bitmap.data[idx]     = SELECTION_HIGHLIGHT.0;
+                                text_bitmap.data[idx + 1] = SELECTION_HIGHLIGHT.1;
+                                text_bitmap.data[idx + 2] = SELECTION_HIGHLIGHT.2;
+                                text_bitmap.data[idx + 3] = 255;
+                            } else if a < 255 {
+                                let inv = 255 - a;
+                                text_bitmap.data[idx]     = ((text_bitmap.data[idx]     as u32 * a + SELECTION_HIGHLIGHT.0 as u32 * inv) / 255) as u8;
+                                text_bitmap.data[idx + 1] = ((text_bitmap.data[idx + 1] as u32 * a + SELECTION_HIGHLIGHT.1 as u32 * inv) / 255) as u8;
+                                text_bitmap.data[idx + 2] = ((text_bitmap.data[idx + 2] as u32 * a + SELECTION_HIGHLIGHT.2 as u32 * inv) / 255) as u8;
+                                text_bitmap.data[idx + 3] = 255;
+                            }
+                        }
+                    }
+                    let _ = palettes;
+                }
+            } else if cache_key.caret_blink_on {
+                let (dx, dy) = Bitmap::caret_index_to_xy(
+                    text,
+                    &font,
+                    caret_max_width,
+                    alignment,
+                    renderer_line_h,
+                    cache_key.sel_end,
+                );
+                let cy = top_spacing as i32 + dy;
+                text_bitmap.fill_rect(dx, cy, dx + 1, cy + font.char_height as i32, (0, 0, 0), &palettes, 1.0);
+            }
+        }
+
+        // Draw border and drop shadow for fields
+        if border > 0 || box_drop_shadow > 0 {
+            let border_color = (0, 0, 0); // Black border
+            let shadow_color = (0, 0, 0); // Black shadow
+            let w = render_width as i32;
+            let h = render_height as i32;
+            let shadow_offset = box_drop_shadow as i32;
+
+            // Calculate the content area (excluding shadow space)
+            let content_width = if shadow_offset > 0 { w - shadow_offset } else { w };
+            let content_height = if shadow_offset > 0 { h - shadow_offset } else { h };
+
+            // Draw drop shadow OUTSIDE the content area (bottom-right)
+            if shadow_offset > 0 {
+                // Right edge shadow - from top+offset to bottom, outside content area
+                text_bitmap.fill_rect(
+                    content_width,
+                    shadow_offset,
+                    w,
+                    h,
+                    shadow_color,
+                    &palettes,
+                    1.0, // Fully opaque shadow
+                );
+                // Bottom edge shadow - from left+offset to right-shadow, outside content area
+                text_bitmap.fill_rect(
+                    shadow_offset,
+                    content_height,
+                    content_width,
+                    h,
+                    shadow_color,
+                    &palettes,
+                    1.0, // Fully opaque shadow
+                );
+                // Corner shadow - where both shadows meet
+                text_bitmap.fill_rect(
+                    content_width,
+                    content_height,
+                    w,
+                    h,
+                    shadow_color,
+                    &palettes,
+                    1.0, // Fully opaque
+                );
+
+                // Clear corner pixels to transparent
+                // Upper-right corner of shadow area (no shadow should appear here)
+                for y in 0..shadow_offset {
+                    for x in content_width..w {
+                        let idx = ((y * render_width as i32 + x) * 4) as usize;
+                        if idx + 3 < text_bitmap.data.len() {
+                            text_bitmap.data[idx + 3] = 0; // Set alpha to 0 (transparent)
+                        }
+                    }
+                }
+                // Lower-left corner of content area (no shadow should appear here)
+                for y in content_height..h {
+                    for x in 0..shadow_offset {
+                        let idx = ((y * render_width as i32 + x) * 4) as usize;
+                        if idx + 3 < text_bitmap.data.len() {
+                            text_bitmap.data[idx + 3] = 0; // Set alpha to 0 (transparent)
+                        }
+                    }
+                }
+            }
+
+            // Draw border INSIDE the content area (not extending into shadow)
+            if border > 0 {
+                let b = border as i32;
+                // Top border
+                text_bitmap.fill_rect(0, 0, content_width, b, border_color, &palettes, 1.0);
+                // Bottom border
+                text_bitmap.fill_rect(0, content_height - b, content_width, content_height, border_color, &palettes, 1.0);
+                // Left border
+                text_bitmap.fill_rect(0, b, b, content_height - b, border_color, &palettes, 1.0);
+                // Right border
+                text_bitmap.fill_rect(content_width - b, b, content_width, content_height - b, border_color, &palettes, 1.0);
+            }
+        }
+
+        // Director draws a scrollbar inside the right edge of a #scroll field.
+        // It sits WITHIN the box (the text area was already narrowed by
+        // FIELD_SCROLLBAR_WIDTH via `wrap_width`), so the sprite does not grow.
+        //
+        // Chrome only: the thumb is not drawn and the arrows are not hit-tested,
+        // because nothing routes clicks to a field scrollbar yet. Movies scroll
+        // these fields from Lingo via `scrollTop` (Summer Resort sets
+        // `member("sign.text").scrollTop = 1` before writing the text), which the
+        // renderer already honours through its draw origin.
+        if let Some((sb, scroll_top)) = scrollbar {
+            let (x0, x1, y0, y1) = (sb.x0, sb.x1, sb.y0, sb.y1);
+            if x0 >= 0 && x1 <= render_width as i32 && y1 - y0 > 2 {
+                let frame = (0, 0, 0);
+                let face = (255, 255, 255);
+
+                // Trough, then a 1px rule down the left edge separating the bar
+                // from the text area.
+                text_bitmap.fill_rect(x0, y0, x1, y1, face, &palettes, 1.0);
+                text_bitmap.fill_rect(x0, y0, x0 + 1, y1, frame, &palettes, 1.0);
+
+                let box_h = sb.arrow_h;
+                if box_h > 2 {
+                    // Rules under the up box and over the down box.
+                    text_bitmap.fill_rect(x0, y0 + box_h - 1, x1, y0 + box_h, frame, &palettes, 1.0);
+                    text_bitmap.fill_rect(x0, y1 - box_h, x1, y1 - box_h + 1, frame, &palettes, 1.0);
+
+                    // Arrow glyphs: hollow chevrons rather than solid triangles,
+                    // which is what Director's field scrollbar draws.
+                    let cx = (x0 + x1) / 2;
+                    let arrow_h = (box_h / 3).max(2);
+                    for r in 0..arrow_h {
+                        // Up: two pixels walking outward and down from the apex.
+                        let y = y0 + (box_h - arrow_h) / 2 + r;
+                        text_bitmap.fill_rect(cx - r, y, cx - r + 1, y + 1, frame, &palettes, 1.0);
+                        text_bitmap.fill_rect(cx + r, y, cx + r + 1, y + 1, frame, &palettes, 1.0);
+                        // Down: mirrored, walking inward toward the apex.
+                        let y = y1 - box_h + (box_h - arrow_h) / 2 + r;
+                        let half = arrow_h - 1 - r;
+                        text_bitmap.fill_rect(cx - half, y, cx - half + 1, y + 1, frame, &palettes, 1.0);
+                        text_bitmap.fill_rect(cx + half, y, cx + half + 1, y + 1, frame, &palettes, 1.0);
+                    }
+                }
+
+                // The lift. Director shows none while the text fits, which is
+                // what `thumb()` returns None for. Filled grey rather than the
+                // trough's white, or it would be invisible against it.
+                if let Some((ty0, ty1)) = sb.thumb(scroll_top) {
+                    let lift = (192, 192, 192);
+                    text_bitmap.fill_rect(x0 + 1, ty0, x1, ty1, lift, &palettes, 1.0);
+                    text_bitmap.fill_rect(x0 + 1, ty0, x1, ty0 + 1, frame, &palettes, 1.0);
+                    text_bitmap.fill_rect(x0 + 1, ty1 - 1, x1, ty1, frame, &palettes, 1.0);
+                }
+            }
+        }
+
+        // Trim the texture to the actual content height so
+        // sprite_rect grows precisely to the laid-out text instead
+        // Trim the upload to the actual content height. For text members
+        // with shorter content this produces a tighter texture; for
+        // longer content, the upload tracks the real layout. Falls back
+        // to render_height when we don't have an exact value (native
+        // renderer path).
+        //
+        // EXCEPTION: when the sprite has a skew/rotation transform
+        // (`keep_authored_height`), the local quad keeps its authored
+        // size and the trimmed shorter texture would be GPU-stretched
+        // into the larger quad, visibly enlarging glyphs. FurniFactory's
+        // rotated displayComputer (member 74) had its 24-px text content
+        // stretched ~2× into a 48-px sprite quad, making "TIME" / "59.65"
+        // oversized in the rotated frame. Use full render_height so the
+        // texture maps 1:1 onto the quad — content sits at the top with
+        // empty rows below, and the rotation transforms position only.
+        // No-trim ONLY for rotation/skew transforms — not for the broader
+        // `keep_authored_height` flag. `keep_authored_height` is also set
+        // for box_type_locked (#fixed/#scroll/#limit) and
+        // multi_par_adjust_locked (#adjust + line breaks), but those flat
+        // sprites need the trim: they over-allocate `render_height` to
+        // wrap-worst-case (`content_estimate`) up at line 1666, and
+        // skipping the trim leaves an over-tall texture that GPU-stretches
+        // into the smaller sprite_rect quad — Worldbuilder Tugboat info-
+        // card #291 had its 200-px content_estimate texture squished into
+        // a 110-px quad, hiding part of the card and the NEXT button.
+        // Rotated/skewed sprites still need no-trim so the authored member
+        // box maps 1:1 (FurniFactory displayComputer member 7).
+        let upload_height: u32 = if cache_key.transform_active {
+            render_height as u32
+        } else {
+            match content_height_actual {
+                Some(h) => {
+                    let with_padding = h + bottom_spacing as i32;
+                    (with_padding.max(1) as u32).min(render_height as u32)
+                }
+                None => render_height as u32,
+            }
+        };
+
+        // Upload the bitmap as a texture
+        let texture = self.context.create_texture().ok()?;
+        self.context
+            .upload_texture_rgba(&texture, render_width as u32, upload_height, &text_bitmap.data)
+            .ok()?;
+        // Cache the texture
+        let gl = self.context.gl().clone();
+        self.rendered_text_cache.insert(
+            &gl,
+            cache_key.clone(),
+            texture.clone(),
+            render_width as u32,
+            upload_height,
+        );
+
+        Some((texture, render_width as u32, upload_height))
+    }
+
+    /// Set preview size
+    pub fn set_preview_size(&mut self, width: u32, height: u32) {
+        self.preview_size = (width, height);
+        self.preview_canvas.set_width(width);
+        self.preview_canvas.set_height(height);
+    }
+
+    /// Set preview container element
+    pub fn set_preview_container_element(
+        &mut self,
+        container_element: Option<web_sys::HtmlElement>,
+    ) {
+        if self.preview_canvas.parent_node().is_some() {
+            self.preview_canvas.remove();
+        }
+        if let Some(container_element) = container_element {
+            container_element
+                .append_child(&self.preview_canvas)
+                .unwrap();
+            self.preview_container_element = Some(container_element);
+        } else {
+            self.preview_container_element = None;
+        }
+    }
+
+    /// Set preview member reference
+    pub fn set_preview_member_ref(&mut self, member_ref: Option<CastMemberRef>) {
+        self.preview_member_ref = member_ref;
+    }
+
+    /// Draw the preview frame using Canvas2D
+    pub fn draw_preview_frame(&mut self, player: &mut DirPlayer) {
+        use wasm_bindgen::Clamped;
+
+        if self.preview_member_ref.is_none()
+            || self.preview_container_element.is_none()
+        {
+            return;
+        }
+
+        let member_ref = self.preview_member_ref.as_ref().unwrap().clone();
+        let bitmap = crate::rendering::render_preview_bitmap(player, &member_ref, self.preview_font_size);
+        if let Some(bitmap) = bitmap {
+            let width = bitmap.width as u32;
+            let height = bitmap.height as u32;
+
+            if self.preview_size.0 != width || self.preview_size.1 != height {
+                self.set_preview_size(width, height);
+            }
+
+            let slice_data = Clamped(bitmap.data.as_slice());
+            let image_data = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+                slice_data,
+                width,
+                height,
+            );
+
+            if let Ok(image_data) = image_data {
+                let _ = self.preview_ctx2d.put_image_data(&image_data, 0.0, 0.0);
+            }
+        }
+    }
+
+    /// Set the canvas size
+    pub fn set_size(&mut self, width: u32, height: u32) {
+        self.size = (width, height);
+        self.canvas.set_width(width);
+        self.canvas.set_height(height);
+        self.context.gl().viewport(0, 0, width as i32, height as i32);
+        // Update projection matrix for new size
+        self.projection_matrix = Self::create_ortho_matrix(width as f32, height as f32);
+    }
+
+    /// Resize the canvas/viewport to `draw_w`x`draw_h` while keeping the sprite
+    /// coordinate space at `movie_w`x`movie_h` — sprites drawn at their native
+    /// movie coords fill the entire (larger or smaller) viewport, matching
+    /// Director's drawRect-scales-movie-to-stage behavior.
+    pub fn set_draw_rect_scaled(&mut self, draw_w: u32, draw_h: u32, movie_w: f32, movie_h: f32) {
+        self.size = (draw_w, draw_h);
+        self.canvas.set_width(draw_w);
+        self.canvas.set_height(draw_h);
+        self.context.gl().viewport(0, 0, draw_w as i32, draw_h as i32);
+        self.projection_matrix = Self::create_ortho_matrix(movie_w, movie_h);
+    }
+
+    /// Get the canvas
+    pub fn canvas(&self) -> &HtmlCanvasElement {
+        &self.canvas
+    }
+
+    /// Get the preview canvas (used to rebuild the renderer on context restore)
+    pub fn preview_canvas(&self) -> &HtmlCanvasElement {
+        &self.preview_canvas
+    }
+
+    /// Get the size
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// Get the backend name
+    pub fn backend_name(&self) -> &'static str {
+        "WebGL2"
+    }
+}
+
+impl super::Renderer for WebGL2Renderer {
+    fn draw_frame(&mut self, player: &mut DirPlayer) {
+        WebGL2Renderer::draw_frame(self, player)
+    }
+
+    fn capture_stage_bitmap(&mut self, player: &mut DirPlayer) -> Bitmap {
+        WebGL2Renderer::capture_stage_bitmap(self, player)
+    }
+
+    fn reset_for_new_movie(&mut self) {
+        // Drop all cached GPU textures and rendered-text bitmaps so sprites
+        // from a previous movie don't bleed into the next one. The Scene3D
+        // backing store also holds per-member GPU resources keyed by cast
+        // ref — clearing those forces rebuild on the next frame.
+        self.texture_cache.clear();
+        self.rendered_text_cache.clear();
+        self.last_palette_version = 0;
+    }
+
+    fn draw_preview_frame(&mut self, player: &mut DirPlayer) {
+        WebGL2Renderer::draw_preview_frame(self, player)
+    }
+
+    fn set_size(&mut self, width: u32, height: u32) {
+        WebGL2Renderer::set_size(self, width, height)
+    }
+
+    fn size(&self) -> (u32, u32) {
+        WebGL2Renderer::size(self)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        WebGL2Renderer::backend_name(self)
+    }
+
+    fn canvas(&self) -> &HtmlCanvasElement {
+        WebGL2Renderer::canvas(self)
+    }
+
+    fn set_preview_member_ref(&mut self, member_ref: Option<CastMemberRef>) {
+        WebGL2Renderer::set_preview_member_ref(self, member_ref)
+    }
+
+    fn set_preview_container_element(&mut self, container_element: Option<web_sys::HtmlElement>) {
+        WebGL2Renderer::set_preview_container_element(self, container_element)
+    }
+
+    fn set_preview_font_size(&mut self, size: Option<u16>) {
+        self.preview_font_size = size;
+    }
+
+    fn preview_font_size(&self) -> Option<u16> {
+        self.preview_font_size
+    }
+
+    fn draw_sprite_isolated(&mut self, player: &mut DirPlayer, channel_num: i16) {
+        // Clear to transparent
+        let gl = self.context.gl();
+        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+
+        // Advance caches so textures are available
+        self.texture_cache.next_frame();
+        self.rendered_text_cache.next_frame();
+
+        self.quad.bind(self.context.gl());
+        self.render_sprite(player, channel_num);
+    }
+}

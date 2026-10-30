@@ -1,0 +1,275 @@
+alpha =  { 'a'..'z' | 'A'..'Z' }
+digit = _{ '0'..'9' }
+
+ident = @{ !digit ~ (alpha | digit | "_")+ }
+
+lang_ident = { !reserved_keyword ~ ident }
+
+reserved_keyword = @{
+    ("sprite" | "castLib" | "member" | "put" | "set" | "to" | "into" | "before" | "after" | "and" | "or" | "not" | "true" | "TRUE" | "True" | "false" | "FALSE" | "False" | "EMPTY" | "RETURN" | "rgb" | "rect" | "point" | "of" | "the" | "char" | "word" | "line" | "item" | "delete" | "field") ~ !(alpha | digit | "_")
+}
+
+void_keyword = _{ ("void" | "VOID" | "Void") ~ !(alpha | digit | "_") }
+void         =  { void_keyword }
+
+dotted_ident = @{ (lang_ident | number_int) ~ ("." ~ (lang_ident | number_int))+ }
+
+string_interior =  {
+    (!("\"") ~ ANY)*
+}
+WHITESPACE      = _{ " " | "\t" | ("\\" ~ ("\r\n" | "\n" | "\r")) | "\r\n" | "\n" | "\r" }
+
+// Symbol names may START WITH A DIGIT, unlike ordinary identifiers.
+// AreaZero stores animation event tables as `[#0: "Fire_XM8", #1: "SpawnShell_XM8"]`
+// (frame number -> event name), and `#0` cannot match `ident`, which is
+// `!digit ~ ...`. The whole list literal then failed to parse, `value()` fell
+// back to the raw string, and the movie alerted "Property list suspected, but
+// couldn't create it" for every one. Keep `ident` strict — only the symbol
+// name is permissive, and the leading "#" keeps it unambiguous against numbers.
+symbol_name    = @{ (alpha | digit | "_")+ }
+symbol         = ${ "#" ~ WHITESPACE* ~ symbol_name }
+nohash_symbol  =  { (ident) }
+quote          = _{ "\"" }
+string         = ${ quote ~ (string_interior) ~ quote }
+string_empty   =  { "EMPTY" }
+return_const   =  { "RETURN" }
+
+// Multi-word properties that need special handling
+the_long_time        = { ^"the" ~ ^"long" ~ ^"time" }
+the_short_time       = { ^"the" ~ ^"short" ~ ^"time" }
+the_abbrev_time      = { ^"the" ~ (^"abbreviated" | ^"abbrev" | ^"abbr") ~ ^"time" }
+the_long_date        = { ^"the" ~ ^"long" ~ ^"date" }
+the_short_date       = { ^"the" ~ ^"short" ~ ^"date" }
+the_abbrev_date      = { ^"the" ~ (^"abbreviated" | ^"abbrev" | ^"abbr") ~ ^"date" }
+the_multi_word_prop  = { the_long_time | the_short_time | the_abbrev_time | the_long_date | the_short_date | the_abbrev_date }
+
+// Property name after "the" - can include some reserved keywords like "rect", "point", etc.
+// that are valid property names but also reserved for other constructs
+the_prop_name  =  { ident }
+
+// Regular single-word properties
+the_prop       =  { the_multi_word_prop | (^"the" ~ lang_ident) }
+the_prop_of    =  { ^"the" ~ the_prop_name ~ ^"of" ~ (castlib_of_expr | sprite_of_expr | prop_of_expr | expr) }
+
+// Special handling for "X of castLib Y" and "X of sprite Y" 
+// These must come BEFORE prop_of_expr to match first
+castlib_of_expr = { lang_ident ~ ^"of" ~ castlib_ref }
+sprite_of_expr = { lang_ident ~ ^"of" ~ sprite_ref }
+prop_of_expr   =  { lang_ident ~ ^"of" ~ expr }
+empty_list     =  { "[]" }
+multi_list     =  { "[" ~ (expr) ~ ("," ~ (expr))* ~ "]" }
+bool_true      =  { ^"true" | ^"True" | ^"TRUE" }
+bool_false     =  { ^"false" | ^"False" | ^"FALSE" }
+number_sign    =  { "+" | "-" }
+float_exponent = ${ ^"e" ~ number_sign? ~ digit+ }
+number_int     = ${ (number_sign?) ~ (digit+) }
+number_float_a = ${ (number_sign?) ~ (digit*) ~ "." ~ (digit+) ~ (float_exponent?) }
+number_float_b = ${ (number_sign?) ~ (digit+) ~ "." ~ (digit*) ~ (float_exponent?) }
+number_float   = ${ number_float_a | number_float_b }
+number         = _{ number_float | number_int }
+
+prop_list_key   = _{ (symbol | nohash_symbol | string | number_float | number_int | void | bool_true | bool_false | string_empty) }
+prop_list_pair  =  { prop_list_key ~ ":" ~ expr }
+empty_prop_list =  { "[" ~ ":" ~ "]" }
+multi_prop_list =  { "[" ~ (prop_list_pair) ~ ("," ~ (prop_list_pair))* ~ "]" }
+prop_list       = _{ empty_prop_list | multi_prop_list }
+
+list = _{ empty_list | multi_list }
+
+rgb_num_arg   = { digit{,3} }
+rgb_num_color = { ^"rgb" ~ "(" ~ (rgb_num_arg) ~ "," ~ (rgb_num_arg) ~ "," ~ (rgb_num_arg) ~ ")" }
+rgb_str_color = { ^"rgb" ~ "(" ~ (string) ~ ")" }
+rgb_color     = { rgb_num_color | rgb_str_color }
+rect          = { ^"rect" ~ "(" ~ expr ~ "," ~ expr ~ "," ~ expr ~ "," ~ expr ~ ")" }
+point         = { ^"point" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
+
+// CastLib references: "castLib 1" or "castLib "levels""
+castlib_ref = { &reserved_keyword ~ ^"castLib" ~ term_arg }
+
+// Member references: "member 5" or "member 5 of castLib 1"
+member_ref = { &reserved_keyword ~ ^"member" ~ "(" ~ expr ~ "," ~ expr ~ ")" | &reserved_keyword ~ ^"member" ~ term_arg ~ (^"of" ~ castlib_ref)? }
+
+// Sprite references: "sprite 17"
+sprite_ref = { &reserved_keyword ~ ^"sprite" ~ term_arg }
+
+// Field references: "field 5" or "field "myField""
+field_ref = { &reserved_keyword ~ ^"field" ~ term_arg }
+
+// `script "name"` — Director's space-separated form, as used by the canonical
+// child-object idiom `new(script "parentScriptName", ...)`. The parenthesised
+// `script("name")` also matches here, because term_arg accepts a parens_expr.
+script_ref = { ^"script" ~ !(alpha | digit | "_") ~ term_arg }
+
+// Chunk expressions for "char 1 of myStr", "line 1 to 3 of myStr", etc.
+chunk_type = { &reserved_keyword ~ (^"char" | ^"word" | ^"line" | ^"item") }
+chunk_range = { ^"to" ~ expr }
+chunk_expr  = { chunk_type ~ expr ~ chunk_range? ~ ^"of" ~ (the_prop_of | the_prop | chunk_expr | field_ref | handler_call | lang_ident) }
+
+// Director's legacy "the number of <chunk> in/of <expr>" — counts lines /
+// words / items / chars in a string. Used by classic behavior scripts:
+//     numMarkers = the number of lines in the labelList
+chunk_count_kind = { ^"chars" | ^"characters" | ^"words" | ^"lines" | ^"items" }
+the_chunk_count  = { ^"the" ~ ^"number" ~ ^"of" ~ chunk_count_kind ~ (^"of" | ^"in") ~ expr }
+
+parens_expr = _{ "(" ~ expr ~ ")" }
+parens_list = { "(" ~ expr ~ ("," ~ expr)+ ~ ")" }
+parens_empty = { "(" ~ ")" }
+
+// List indexing - postfix operator for accessing list elements
+list_index = { "[" ~ expr ~ "]" }
+
+// Boolean operators
+and_op = { ^"and" }
+or_op  = { ^"or" }
+not_op = { ^"not" }
+// Unary minus on an EXPRESSION (`-pWorldUp`). Ordered after `primitive` in
+// `term` so a signed literal (`-5`) still parses as one `number_int` rather
+// than a negation of 5; only a `-` followed by something non-numeric gets here.
+neg_op = { "-" }
+
+// Comparison operators
+eq_op = { "=" }
+ne_op = { "<>" }
+lt_op = { "<" }
+gt_op = { ">" }
+le_op = { "<=" }
+ge_op = { ">=" }
+
+// Property name after dot - can be any identifier including reserved keywords
+prop_name  =  { ident }
+
+primitive       = _{ put_handler_call | sprite_ref | castlib_ref | member_ref | field_ref | script_ref | handler_call | the_chunk_count | the_prop_of | the_prop | symbol | list | string | prop_list | number_float | number_int | rgb_color | rect | void | bool_true | bool_false | string_empty | point | return_const | parens_list | parens_expr | chunk_expr | castlib_of_expr | sprite_of_expr | prop_of_expr | lang_ident }
+eval_expr       = _{ SOI ~ expr ~ EOI }
+ident_list      = _{ !digit ~ ident ~ (" " ~ ident)+ }
+
+handler_call_args               =  { expr ~ ("," ~ expr)* }
+command_inline_args_comma        =  { expr ~ ("," ~ expr)+ }
+command_inline_args_space        =  { term_arg ~ term_arg+ }
+command_inline_args_single       =  { expr }
+command_inline_args              = _{ command_inline_args_comma | command_inline_args_space | command_inline_args_single }
+// put() with parentheses must have at least one argument, otherwise it's an error
+put_handler_call                 =  { ^"put" ~ "(" ~ handler_call_args ~ ")" }
+// Allow other handlers with parentheses to be called normally
+handler_call                     =  { lang_ident ~ "(" ~ handler_call_args? ~ ")" }
+command_inline                   =  { lang_ident ~ !(WHITESPACE* ~ ("(" | "." | "=")) ~ command_inline_args }
+
+// Put statement variations (order matters - most specific first!)
+put_into_chunk   = { ^"put" ~ expr ~ ^"into" ~ chunk_expr }
+put_before_chunk = { ^"put" ~ expr ~ ^"before" ~ chunk_expr }
+put_after_chunk  = { ^"put" ~ expr ~ ^"after" ~ chunk_expr }
+put_into         = { ^"put" ~ expr ~ ^"into" ~ ident }
+put_before       = { ^"put" ~ expr ~ ^"before" ~ ident }
+put_after        = { ^"put" ~ expr ~ ^"after" ~ ident }
+// put_display_multi handles "put 1, 2, 3" as a handler call with multiple args
+put_display_multi = { ^"put" ~ expr ~ ("," ~ expr)+ }
+// put_display handles single expressions (excluding direct parenthesized calls)
+put_display      = { ^"put" ~ !(parens_list | parens_empty) ~ expr }
+
+put_statement = {
+    put_into_chunk
+  | put_before_chunk
+  | put_after_chunk
+  | put_into
+  | put_before
+  | put_after
+  | put_display_multi
+  | put_display
+}
+
+// Set statement: "set the locV of sprite 17 to 233"
+// This is syntactic sugar for assignment
+set_statement = { ^"set" ~ expr ~ ^"to" ~ expr }
+
+// Delete statement: "delete char 1 of s", "delete word 3 of myStr"
+delete_statement = { ^"delete" ~ chunk_expr }
+
+// Lingo "go" command. "to", "frame", and "movie" are syntactic noise; only
+// the destination value (and optional movie path) need to reach the
+// handler. Accepts: "go", "go N", "go "label"", "go to "label"",
+// "go to frame N", "go frame N of movie "path"", "go to N of movie "path"".
+// Skipped when followed by "(" so go(...) still parses as a normal
+// handler_call.
+//
+// Each keyword is an atomic rule so the word-boundary lookahead is checked
+// adjacent to the keyword (in a non-atomic context pest's implicit
+// WHITESPACE would be eaten between the keyword and the lookahead, making
+// it always pass).
+go_kw      = @{ ^"go"    ~ !(alpha | digit | "_") }
+go_to_kw   = @{ ^"to"    ~ !(alpha | digit | "_") }
+go_frame_kw = @{ ^"frame" ~ !(alpha | digit | "_") }
+go_movie_kw = @{ ^"movie" ~ !(alpha | digit | "_") }
+go_of_kw   = @{ ^"of"    ~ !(alpha | digit | "_") }
+go_inline = {
+    go_kw ~ !(WHITESPACE* ~ "(")
+    ~ go_to_kw?
+    ~ go_frame_kw?
+    ~ (term_arg ~ (go_of_kw ~ go_movie_kw? ~ term_arg)?)?
+}
+
+// Assignment can be to any expression (identifier, property access, list index, etc.)
+// The parser will validate that the left side is a valid lvalue
+assignment_expr = { term ~ (obj_prop ~ (prop_name | term) | list_index)* }
+assignment = { assignment_expr ~ "=" ~ expr }
+
+// `if EXPR then COMMAND` inline form (no `else`, no `end if`). Director's
+// runtime text-eval contexts (keyUpScript / mouseUpScript / `do "…"`) use
+// this; the multi-line `if … end if` form lives in the compiled-bytecode
+// path. The keywords are atomic-with-word-boundary so e.g. an identifier
+// `iffy` doesn't tokenise as `if` + `fy`.
+if_kw       = @{ ^"if"   ~ !(alpha | digit | "_") }
+then_kw     = @{ ^"then" ~ !(alpha | digit | "_") }
+if_inline   =  { if_kw ~ expr ~ then_kw ~ command }
+
+// `pass` — "let the event keep propagating to the next handler in the
+// chain". In a text-eval context (where there's no handler chain being
+// walked) it's a no-op; the evaluator returns Void.
+pass_kw     = @{ ^"pass" ~ !(alpha | digit | "_") }
+pass_stmt   =  { pass_kw }
+
+// Legacy `sound <verb> <args>` command form, e.g. `sound fadeIn 2, 60`,
+// `sound stop 3`, `sound playFile 1, "snd"`. Director treats the word after
+// `sound` as a verb keyword (not a variable); the evaluator turns it into the
+// #verb symbol so it dispatches through the same path as `sound(2).fadeIn(60)`.
+// `sound_kw` is atomic-with-word-boundary so `soundLevel` / `sound(2)` /
+// `sound = 5` don't tokenise as this command.
+sound_kw        = @{ ^"sound" ~ !(alpha | digit | "_") }
+sound_verb      =  { ident }
+sound_statement =  { sound_kw ~ sound_verb ~ command_inline_args? }
+
+command    = _{ if_inline | pass_stmt | set_statement | delete_statement | assignment | put_statement | go_inline | sound_statement | command_inline | expr }
+obj_prop   =  { "." }
+add        =  { "+" }
+subtract   =  { "-" }
+multiply   =  { "*" }
+divide     =  { "/" }
+// Word operator: must not swallow the start of an identifier (`modelCount`).
+mod_op     = @{ ^"mod" ~ !(alpha | digit | "_") }
+join       =  { "&" }
+join_pad   =  { "&&" }
+bin_op     = _{
+    obj_prop
+  | and_op
+  | or_op
+  | eq_op
+  | ne_op
+  | lt_op
+  | gt_op
+  | le_op
+  | ge_op
+  | add
+  | subtract
+  | multiply
+  | divide
+  | mod_op
+  | join_pad
+  | join
+}
+postfix_op = _{ list_index }
+expr       =  { term ~ (bin_op ~ term | postfix_op)* }
+term       = _{ not_op ~ term | primitive | neg_op ~ term | prop_name }
+term_arg   =  { not_op ~ term_arg | primitive | neg_op ~ term_arg }
+
+command_eval_expr = _{ SOI ~ command ~ EOI }
+// Configuration key support - allows asterisks and dots in keys
+config_ident_part = @{ (alpha | digit | "_" | "*")+ }
+config_key = @{ !digit ~ config_ident_part ~ ("." ~ config_ident_part)* }

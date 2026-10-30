@@ -1,0 +1,1352 @@
+use std::collections::HashMap;
+use std::str::FromStr;
+
+use crate::console_warn;
+use crate::director::chunks::config::ConfigChunk;
+use crate::director::chunks::key_table::KeyTableChunk;
+use crate::director::guid::*;
+use crate::director::rifx::RIFXReaderContext;
+use crate::director::utils::*;
+use crate::io::reader::DirectorExt;
+use binary_reader::BinaryReader;
+use itertools::Itertools;
+use log::debug;
+use log::warn;
+use url::Url;
+
+use super::cast::CastDef;
+use super::chunks::cast::CastChunk;
+use super::chunks::cast_info::CastInfoChunk;
+use super::chunks::cast_list::CastListChunk;
+use super::chunks::cast_list::CastListEntry;
+use super::chunks::cast_member::CastMemberChunk;
+use super::chunks::effect::EffectChunk;
+use super::chunks::key_table::KeyTableEntry;
+use super::chunks::lctx::ScriptContextChunk;
+use super::chunks::make_chunk;
+use super::chunks::media::MediaChunk;
+use super::chunks::score::FrameLabelsChunk;
+use super::chunks::score::ScoreChunk;
+use super::chunks::score_order::SordChunk;
+use super::chunks::script::ScriptChunk;
+use super::chunks::script_names::ScriptNamesChunk;
+use super::chunks::sound::SoundChunk;
+use super::chunks::thum::ThumChunk;
+use super::chunks::xmedia::XMediaChunk;
+use super::chunks::Chunk;
+use super::chunks::ChunkContainer;
+use super::chunks::ChunkInfo;
+use binary_reader::Endian;
+
+pub struct DirectorFile {
+    pub base_path: Url,
+    pub file_name: String,
+    pub endian: Endian,
+    pub after_burned: bool,
+    pub version: u16,
+    pub cast_entries: Vec<CastListEntry>,
+    pub casts: Vec<CastDef>,
+    pub config: ConfigChunk,
+    pub score: Option<ScoreChunk>,
+    pub tile_list: Option<super::chunks::tile_list::TileListChunk>,
+    pub frame_labels: Option<FrameLabelsChunk>,
+    pub score_order: Option<SordChunk>,
+    pub media: Option<MediaChunk>,
+    pub xmedia: Option<XMediaChunk>,
+    pub cast_info: Option<CastInfoChunk>,
+    pub effect: Option<EffectChunk>,
+    pub thum: Option<ThumChunk>,
+    pub xtra_list: Option<crate::director::chunks::xtra_list::XtraListChunk>,
+    pub key_table: Option<KeyTableChunk>,
+    pub chunk_container: ChunkContainer,
+    pub font_table: HashMap<u16, String>,
+}
+
+// macro_rules! console_log {
+//   // Note that this is using the `log` function imported above during
+//   // `bare_bones`
+//   ($($t:tt)*) => (web_sys::console::log_1(&JsValue::from_str(format_args!($($t)*).to_string().as_str())))
+// }
+
+impl DirectorFile {
+    #[allow(unused_variables, unused_assignments)]
+    fn read(
+        file_name: String,
+        base_path: Url,
+        reader: &mut BinaryReader,
+    ) -> Result<DirectorFile, String> {
+        reader.set_endian(binary_reader::Endian::Big);
+
+        let mut chunk_container = ChunkContainer {
+            cached_chunk_views: HashMap::new(),
+            chunk_info: HashMap::new(),
+            deserialized_chunks: HashMap::new(),
+        };
+
+        let meta_fourcc = reader.read_u32().map_err(|e| format!("Failed to read file header: {}", e))?;
+        let endian = if meta_fourcc == FOURCC("XFIR") {
+            reader.set_endian(binary_reader::Endian::Little);
+            binary_reader::Endian::Little
+        } else {
+            binary_reader::Endian::Big
+        };
+
+        let _ = reader.read_u32().map_err(|e| format!("Failed to read meta length: {}", e))?; // meta length
+        let codec = reader.read_u32().map_err(|e| format!("Failed to read codec: {}", e))?;
+        let mut after_burned = false;
+        let mut ils_body_offset: usize = 0;
+
+        if codec == FOURCC("MV93") || codec == FOURCC("MC95") {
+            read_memory_map(reader, &mut chunk_container.chunk_info)?;
+        } else if codec == FOURCC("FGDM") || codec == FOURCC("FGDC") {
+            after_burned = true;
+            ils_body_offset = read_after_burner_map(
+                reader,
+                &mut chunk_container.cached_chunk_views,
+                &mut chunk_container.chunk_info,
+            )
+            .unwrap();
+        } else {
+            return Err("Invalid codec".to_owned());
+        }
+
+        let mut rifx = RIFXReaderContext {
+            after_burned: after_burned,
+            ils_body_offset: ils_body_offset,
+            dir_version: 0,
+            lctx_capital_x: false,
+        };
+
+        let key_table = read_key_table(reader, &mut chunk_container, &mut rifx).unwrap();
+
+        let config = read_config(reader, &mut chunk_container, &mut rifx).unwrap();
+
+        rifx.dir_version = human_version(config.director_version);
+        let dot_syntax = rifx.dir_version >= 700;
+
+        // info!("width={}, height={}", config.movie_right - config.movie_left, config.movie_bottom - config.movie_top);
+
+        let (cast_entries, casts) =
+            read_casts(reader, &mut chunk_container, &mut rifx, &key_table, &config).unwrap();
+
+        let font_table = parse_font_table(reader, &mut chunk_container, &mut rifx);
+
+        let score = get_score_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let tile_list = get_tile_list_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let frame_labels = get_frame_labels_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let score_order = get_score_order_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let media = get_media_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let xmedia = get_xmedia_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let cast_info = get_cast_info_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let effect = get_effect_chunk(reader, &mut chunk_container, &mut rifx);
+
+        let thum = get_thum_chunk(reader, &mut chunk_container, &mut rifx);
+
+        // XTRl carries the movie's xtra dependencies. Optional — many
+        // legacy movies don't have one; older Director versions never
+        // wrote it. When present, the host's plugin loader uses this
+        // list to resolve xtra names against its name->URL registry.
+        let xtra_list = get_xtra_list_chunk(reader, &mut chunk_container, &mut rifx);
+
+        return Ok(DirectorFile {
+            base_path,
+            file_name,
+            endian,
+            after_burned,
+            version: rifx.dir_version,
+            casts,
+            cast_entries,
+            config,
+            score,
+            tile_list,
+            frame_labels,
+            score_order,
+            media,
+            xmedia,
+            cast_info,
+            effect,
+            thum,
+            xtra_list,
+            key_table: Some(key_table),
+            chunk_container,
+            font_table,
+        });
+    }
+}
+
+pub fn get_variable_multiplier(capital_x: bool, dir_version: u16) -> u32 {
+    // TODO: Determine what version this changed to 1.
+    // For now approximating it with the point at which Lctx changed to LctX.
+    if capital_x {
+        return 1;
+    }
+    if dir_version >= 500 {
+        return 8;
+    }
+    return 6;
+}
+
+fn parse_fmap_v4(data: &[u8]) -> HashMap<u16, String> {
+    let mut result = HashMap::new();
+    if data.len() < 36 {
+        return result;
+    }
+
+    let map_length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let _names_length = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let body_start = 8;
+    let names_start = body_start + map_length;
+
+    // Header: 7 x u32 (unk1, unk2, entriesUsed, entriesTotal, unk3, unk4, unk5)
+    if data.len() < body_start + 28 {
+        return result;
+    }
+    let entries_used = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
+
+    // Each entry: u32 nameOffset + u16 platform + u16 fontId = 8 bytes
+    let entries_start = body_start + 28;
+    for i in 0..entries_used {
+        let entry_offset = entries_start + i * 8;
+        if entry_offset + 8 > data.len() {
+            break;
+        }
+        let name_offset = u32::from_be_bytes([
+            data[entry_offset], data[entry_offset + 1],
+            data[entry_offset + 2], data[entry_offset + 3],
+        ]) as usize;
+        let _platform = u16::from_be_bytes([data[entry_offset + 4], data[entry_offset + 5]]);
+        let font_id = u16::from_be_bytes([data[entry_offset + 6], data[entry_offset + 7]]);
+
+        // Read font name from names section
+        let name_pos = names_start + name_offset;
+        if name_pos + 4 > data.len() {
+            continue;
+        }
+        let name_length = u32::from_be_bytes([
+            data[name_pos], data[name_pos + 1], data[name_pos + 2], data[name_pos + 3],
+        ]) as usize;
+        let name_data_start = name_pos + 4;
+        if name_data_start + name_length > data.len() {
+            continue;
+        }
+        let font_name = String::from_utf8_lossy(&data[name_data_start..name_data_start + name_length])
+            .trim_end_matches('\0')
+            .to_string();
+
+        result.insert(font_id, font_name);
+    }
+    result
+}
+
+fn parse_vwfm(data: &[u8]) -> HashMap<u16, String> {
+    let mut result = HashMap::new();
+    if data.len() < 2 {
+        return result;
+    }
+
+    let count = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let offset = count * 2 + 2;
+
+    // Read font IDs
+    let mut font_ids = Vec::with_capacity(count);
+    for i in 0..count {
+        let pos = 2 + i * 2;
+        if pos + 2 > data.len() {
+            return result;
+        }
+        font_ids.push(u16::from_be_bytes([data[pos], data[pos + 1]]));
+    }
+
+    // Read Pascal strings for font names
+    let mut current_pos = offset;
+    for (i, &font_id) in font_ids.iter().enumerate() {
+        if current_pos >= data.len() {
+            break;
+        }
+        let name_len = data[current_pos] as usize;
+        current_pos += 1;
+        if current_pos + name_len > data.len() {
+            break;
+        }
+        let font_name = String::from_utf8_lossy(&data[current_pos..current_pos + name_len]).to_string();
+        current_pos += name_len;
+        result.insert(font_id, font_name);
+        let _ = i; // suppress unused warning
+    }
+    result
+}
+
+fn parse_font_table(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> HashMap<u16, String> {
+    // Merge ALL Fmap/VWFM chunks in the file. Director files with multiple internal
+    // casts can have multiple Fmap chunks (one per cast). HashMap iteration is
+    // non-deterministic, so picking just the "first" Fmap is a bug — different runs
+    // would select different chunks, producing different font_id→name mappings.
+    let fmap_fourcc = FOURCC("Fmap");
+    let vwfm_fourcc = FOURCC("VWFM");
+
+    // Collect all Fmap and VWFM chunk ids
+    let chunk_ids: Vec<(u32, u32)> = chunk_container.chunk_info
+        .iter()
+        .filter(|(_, info)| info.fourcc == fmap_fourcc || info.fourcc == vwfm_fourcc)
+        .map(|(_, info)| (info.fourcc, info.id))
+        .collect();
+
+    if chunk_ids.is_empty() {
+        debug!("No Fmap or VWFM font table chunk found");
+        return HashMap::new();
+    }
+
+    let mut merged_table: HashMap<u16, String> = HashMap::new();
+
+    for (fourcc, chunk_id) in &chunk_ids {
+        let raw = match get_chunk_data(reader, chunk_container, rifx, *fourcc, *chunk_id) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to read font table chunk {}: {}", chunk_id, e);
+                continue;
+            }
+        };
+
+        let table = if *fourcc == fmap_fourcc {
+            parse_fmap_v4(&raw)
+        } else {
+            parse_vwfm(&raw)
+        };
+
+        // Merge: later entries don't overwrite earlier ones for the same font_id
+        for (id, name) in table {
+            merged_table.entry(id).or_insert(name);
+        }
+    }
+
+    debug!(
+        "[Fmap] {} entries (from {} chunks): {:?}",
+        merged_table.len(),
+        chunk_ids.len(),
+        merged_table.iter().map(|(id, name)| format!("{}='{}'", id, name)).collect::<Vec<_>>()
+    );
+
+    merged_table
+}
+
+fn read_casts(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    key_table: &KeyTableChunk,
+    config: &ConfigChunk,
+) -> Result<(Vec<CastListEntry>, Vec<CastDef>), String> {
+    let mut internal = true;
+    let mut casts: Vec<CastDef> = Vec::new();
+
+    if rifx.dir_version >= 500 {
+        let cast_list = get_cast_list_chunk(reader, chunk_container, rifx);
+        if cast_list.is_some() {
+            let cast_list = cast_list.unwrap();
+            for cast_entry in &cast_list.entries {
+                // External casts (with file_path) have their data in separate .cct files,
+                // not in this movie file. Skip CAS* lookup to avoid false matches
+                // when the external entry shares a cast_id with an internal cast.
+                let cast = if !cast_entry.file_path.is_empty() {
+                    None
+                } else {
+                    get_cast_chunk_for_cast(
+                        reader,
+                        chunk_container,
+                        rifx,
+                        key_table,
+                        &cast_entry.id,
+                    )
+                };
+                if cast.is_none() && cast_entry.file_path.is_empty() {
+                    // Cast has no CAS* chunk AND no file_path - this is unusual
+                    // It should either be internal (has CAS*) or external (has file_path)
+                    log::warn!(
+                        "Cast '{}' (id={}) has no CAS* chunk and no file_path - data may be missing",
+                        &cast_entry.name, &cast_entry.id
+                    );
+                }
+                if let Some(cast) = cast {
+                    // TODO cast.populate(castEntry.name, castEntry.id, castEntry.minMember);
+                    // info!("Cast {} member count: {}", cast_entry.name, cast.member_ids.len());
+                    let palette_id_offset = 0i16;
+                    casts.push(
+                        CastDef::from(
+                            cast_entry.name.to_owned(),
+                            cast_entry.id,
+                            cast_entry.min_member,
+                            cast.member_ids.to_vec(),
+                            reader,
+                            chunk_container,
+                            rifx,
+                            key_table,
+                            palette_id_offset,
+                        )
+                        .unwrap(),
+                    );
+                    // TODO populate
+                }
+            }
+
+            return Ok((cast_list.entries, casts));
+        } else {
+            internal = false;
+        }
+    }
+
+    let cast = get_first_chunk(reader, chunk_container, rifx, FOURCC("CAS*"));
+    if let Some(Chunk::Cast(cast)) = cast {
+        let cast_name = (if internal { "Internal" } else { "External" }).to_string();
+        casts.push(
+            CastDef::from(
+                cast_name.clone(),
+                1024,
+                config.min_member,
+                cast.member_ids.to_vec(),
+                reader,
+                chunk_container,
+                rifx,
+                key_table,
+                0, // No offset needed: Config.min_member is used directly
+            )
+            .unwrap(),
+        );
+
+        // Pre-D5 movies (Director 4 and earlier) have no MCsL cast-list chunk:
+        // there is a single implicit internal cast referenced directly by CAS*.
+        // CastManager::load_from_dir builds its CastLib list by iterating
+        // `cast_entries`, so without a synthetic entry here the single D4 cast
+        // is parsed but never instantiated, leaving `cast_manager.casts` empty
+        // (and later `casts[0]` accesses panic). Synthesize one entry whose `id`
+        // matches the CastDef above so load_from_dir links them up.
+        let synthetic_entry = CastListEntry {
+            name: cast_name,
+            file_path: String::new(), // internal cast
+            preload_settings: 0,
+            min_member: config.min_member,
+            max_member: config.max_member,
+            id: 1024,
+        };
+
+        return Ok((vec![synthetic_entry], casts));
+    }
+
+    debug!("No cast!");
+    return Ok((Vec::new(), casts));
+}
+
+fn find_key_table_entry_for_cast<'b>(
+    key_table: &'b KeyTableChunk,
+    cast_id: &u32,
+) -> Option<&'b KeyTableEntry> {
+    let res = key_table
+        .entries
+        .iter()
+        .find(|entry| entry.cast_id == *cast_id && entry.fourcc == FOURCC("CAS*"));
+    return res;
+}
+
+fn get_cast_chunk_for_cast(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    key_table: &KeyTableChunk,
+    cast_id: &u32,
+) -> Option<CastChunk> {
+    let key_entry = find_key_table_entry_for_cast(key_table, cast_id);
+    if let Some(key_entry) = key_entry {
+        return Some(get_cast_chunk(
+            reader,
+            chunk_container,
+            rifx,
+            key_entry.section_id,
+        ));
+    } else {
+        return None;
+    }
+}
+
+pub fn get_cast_member_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    section_id: u32,
+) -> CastMemberChunk {
+    let chunk = get_chunk(reader, chunk_container, rifx, FOURCC("CASt"), section_id).unwrap();
+    if let Chunk::CastMember(member_chunk) = chunk {
+        return member_chunk;
+    } else {
+        panic!("Not a cast member chunk");
+    }
+}
+
+pub fn get_cast_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    section_id: u32,
+) -> CastChunk {
+    let chunk = get_chunk(reader, chunk_container, rifx, FOURCC("CAS*"), section_id).unwrap();
+    if let Chunk::Cast(cast_chunk) = chunk {
+        return cast_chunk;
+    } else {
+        panic!("Not a cast chunk");
+    }
+}
+
+pub fn get_cast_list_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<CastListChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("MCsL"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::CastList(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a cast list chunk");
+    }
+}
+
+pub fn get_score_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<ScoreChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("VWSC"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::Score(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a score chunk");
+    }
+}
+
+pub fn get_tile_list_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<super::chunks::tile_list::TileListChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("VWTL"));
+    match chunk {
+        Some(Chunk::TileList(chunk_data)) => Some(chunk_data),
+        _ => None,
+    }
+}
+
+pub fn get_media_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<MediaChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("ediM"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::Media(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a media chunk");
+    }
+}
+
+pub fn get_xmedia_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<XMediaChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("XMED"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::XMedia(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a xmedia chunk");
+    }
+}
+
+pub fn get_thum_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<ThumChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("Thum"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::Thum(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a Thum chunk");
+    }
+}
+
+pub fn get_xtra_list_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<crate::director::chunks::xtra_list::XtraListChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("XTRl"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::XtraList(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not an XTRl chunk");
+    }
+}
+
+pub fn get_cast_info_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<CastInfoChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("Cinf"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::CstInfo(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a Cinf chunk");
+    }
+}
+
+pub fn get_effect_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<EffectChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("FXmp"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::Effect(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a FXmp chunk");
+    }
+}
+
+pub fn get_score_order_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<SordChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("Sord"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::ScoreOrder(chunk_data) = chunk.unwrap() {
+        return Some(chunk_data);
+    } else {
+        panic!("Not a score order chunk");
+    }
+}
+
+pub fn get_script_context_key_entry_for_cast<'a>(
+    _reader: &mut BinaryReader,
+    _chunk_container: &mut ChunkContainer,
+    key_table: &'a KeyTableChunk,
+    _rifx: &RIFXReaderContext,
+    cast_id: u32,
+) -> Option<&'a KeyTableEntry> {
+    return key_table.entries.iter().find(|entry| {
+        entry.cast_id == cast_id
+            && (entry.fourcc == FOURCC("Lctx") || entry.fourcc == FOURCC("LctX"))
+    });
+}
+
+pub fn get_script_context_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    fourcc: u32,
+    section_id: u32,
+) -> Option<ScriptContextChunk> {
+    let chunk = match get_chunk(reader, chunk_container, rifx, fourcc, section_id) {
+        Ok(chunk) => chunk,
+        Err(e) => {
+            console_warn!("get_script_context_chunk: Could not find chunk {} ${:x}: {}", fourcc_to_string(fourcc), section_id, e);
+            return None;
+        }
+    };
+
+    if let Chunk::ScriptContext(context) = chunk {
+        return Some(context);
+    } else {
+        console_warn!("get_script_context_chunk: Chunk {} ${:x} is not a ScriptContext", fourcc_to_string(fourcc), section_id);
+        return None;
+    }
+}
+
+pub fn get_script_names_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    fourcc: u32,
+    section_id: u32,
+) -> Option<ScriptNamesChunk> {
+    let chunk = match get_chunk(reader, chunk_container, rifx, fourcc, section_id) {
+        Ok(chunk) => chunk,
+        Err(e) => {
+            console_warn!("get_script_names_chunk: Could not find chunk {} ${:x}: {}", fourcc_to_string(fourcc), section_id, e);
+            return None;
+        }
+    };
+
+    if let Chunk::ScriptNames(names) = chunk {
+        return Some(names);
+    } else {
+        console_warn!("get_script_names_chunk: Chunk {} ${:x} is not a ScriptNames", fourcc_to_string(fourcc), section_id);
+        return None;
+    }
+}
+
+pub fn get_frame_labels_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Option<FrameLabelsChunk> {
+    let chunk = get_first_chunk(reader, chunk_container, rifx, FOURCC("VWLB"));
+    if chunk.is_none() {
+        return None;
+    } else if let Chunk::FrameLabels(labels) = chunk.unwrap() {
+        return Some(labels);
+    } else {
+        panic!("Not a frame labels chunk");
+    }
+}
+
+pub fn get_script_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    fourcc: u32,
+    section_id: u32,
+) -> Option<ScriptChunk> {
+    let chunk = get_chunk(reader, chunk_container, rifx, fourcc, section_id).unwrap();
+
+    if let Chunk::Script(script) = chunk {
+        return Some(script);
+    } else {
+        panic!("Not a script chunk");
+    }
+}
+
+fn read_config(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Result<ConfigChunk, String> {
+    let info = get_first_chunk_info(&chunk_container.chunk_info, FOURCC("DRCF")).or(
+        get_first_chunk_info(&chunk_container.chunk_info, FOURCC("VWCF")),
+    );
+
+    match info {
+        Some(info) => {
+            if let Chunk::Config(config) =
+                get_chunk(reader, chunk_container, rifx, info.fourcc, info.id).unwrap()
+            {
+                return Ok(config);
+            } else {
+                panic!("Not a config chunk");
+            }
+        }
+        None => {
+            return Err("No config chunk!".to_owned());
+        }
+    }
+}
+
+fn read_after_burner_map(
+    reader: &mut BinaryReader,
+    cached_chunk_views: &mut HashMap<u32, Vec<u8>>,
+    chunk_info: &mut HashMap<u32, ChunkInfo>,
+) -> Result<usize, String> {
+    let start: usize;
+    let end: usize;
+
+    // File version
+    if reader.read_u32().unwrap() != FOURCC("Fver") {
+        return Err("readAfterburnerMap(): Fver expected but not found".to_owned());
+    }
+
+    let fver_length = reader.read_var_int().unwrap();
+    start = reader.pos;
+    let fver_version = reader.read_var_int().unwrap();
+    // info!("Fver: version {}", fver_version);
+    if fver_version >= 0x401 {
+        let _imap_version = reader.read_var_int().unwrap();
+        let _director_version = reader.read_var_int().unwrap();
+        // info!("Fver: imapVersion: {} directorVersion: {}", imap_version, director_version);
+    }
+    if fver_version >= 0x501 {
+        let version_string_len = reader.read_u8().unwrap();
+        let _fver_version_string = String::from_utf8(
+            reader
+                .read_bytes(version_string_len as usize)
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // info!("Fver: versionString: {}", fver_version_string);
+    }
+    end = reader.pos;
+
+    if end - start != fver_length as usize {
+        // info!("read_after_burner_map(): Expected Fver of length {} but read {} bytes", fver_length, end - start);
+        reader.jmp(start + fver_length as usize);
+    }
+
+    // Compression types
+    if reader.read_u32().unwrap() != FOURCC("Fcdr") {
+        return Err("readAfterburnerMap(): Fcdr expected but not found".to_owned());
+    }
+
+    let fcdr_length = reader.read_var_int().unwrap();
+    let fcdr_uncomp = reader.read_zlib_bytes(fcdr_length as usize).unwrap();
+
+    let mut fcdr_reader = BinaryReader::from_vec(&fcdr_uncomp);
+    fcdr_reader.set_endian(reader.endian);
+
+    let compression_type_count = fcdr_reader.read_u16().unwrap();
+    let compression_ids: Vec<MoaID> = (0..compression_type_count)
+        .map(|_| MoaID::from_reader(&mut fcdr_reader))
+        .collect();
+    let compression_descs: Vec<String> = (0..compression_type_count)
+        .map(|_| fcdr_reader.read_cstr().unwrap())
+        .collect();
+
+    // for desc in &compression_descs {
+    //   info!("{}", desc);
+    // }
+
+    if fcdr_reader.pos != fcdr_reader.length {
+        warn!(
+            "readAfterburnerMap(): Fcdr has uncompressed length {} but read {} bytes",
+            fcdr_reader.length, fcdr_reader.pos
+        );
+    }
+
+    // info!("Fcdr: {} compression types", compression_type_count);
+
+    for i in 0..compression_type_count {
+        let _id = &compression_ids[i as usize];
+        let _desc = &compression_descs[i as usize];
+        // info!("Fcdr: type {}: {} \"{}\"", i, id, desc);
+    }
+
+    if reader.read_u32().unwrap() != FOURCC("ABMP") {
+        return Err("RIFXArchive::readAfterburnerMap(): ABMP expected but not found".to_owned());
+    }
+
+    let abmp_length = reader.read_var_int().unwrap();
+    let abmp_end = reader.pos + abmp_length as usize;
+    let _abmp_compression_type = reader.read_var_int().unwrap();
+    let abmp_uncomp_length = reader.read_var_int().unwrap();
+    // info!("ABMP: length: {} compressionType: {} uncompressedLength: {}", abmp_length, abmp_compression_type, abmp_uncomp_length);
+
+    let abmp_uncomp = reader.read_zlib_bytes(abmp_end - reader.pos).unwrap();
+    if abmp_uncomp.len() != abmp_uncomp_length as usize {
+        warn!(
+            "ABMP: Expected uncompressed length {} but got length {}",
+            abmp_uncomp_length,
+            abmp_uncomp.len()
+        );
+    }
+    let mut abmp_reader = BinaryReader::from_vec(&abmp_uncomp);
+    abmp_reader.set_endian(reader.endian);
+
+    let _abmp_unk1 = abmp_reader.read_var_int().unwrap();
+    let _abmp_unk2 = abmp_reader.read_var_int().unwrap();
+    let res_count = abmp_reader.read_var_int().unwrap();
+    // info!("ABMP: unk1: {} unk2: {} resCount: {}", abmp_unk1, abmp_unk2, res_count);
+
+    for _ in 0..res_count {
+        let res_id = abmp_reader.read_var_int().unwrap() as u32;
+        let offset = abmp_reader.read_var_int().unwrap() as usize;
+        let comp_size = abmp_reader.read_var_int().unwrap() as usize;
+        let uncomp_size = abmp_reader.read_var_int().unwrap() as usize;
+        let compression_type = abmp_reader.read_var_int().unwrap() as u32;
+        let tag = abmp_reader.read_u32().unwrap();
+
+        // info!(
+        //   "Found RIFX resource index {}: '{}', {} bytes ({} uncompressed) @ pos {}, compressionType: {}",
+        //   res_id,
+        //   fourcc_to_string(tag),
+        //   comp_size,
+        //   uncomp_size,
+        //   offset,
+        //   compression_type
+        // );
+
+        let info = ChunkInfo {
+            id: res_id,
+            fourcc: tag,
+            len: comp_size,
+            uncompressed_len: uncomp_size,
+            offset: offset,
+            compression_id: compression_ids[compression_type as usize],
+        };
+        chunk_info.insert(res_id, info);
+    }
+
+    // Initial load segment
+    if !chunk_info.contains_key(&2) {
+        return Err("readAfterburnerMap(): Map has no entry for ILS".to_owned());
+    }
+    if reader.read_u32().unwrap() != FOURCC("FGEI") {
+        return Err("readAfterburnerMap(): FGEI expected but not found".to_owned());
+    }
+
+    let ils_info = chunk_info.get(&2).unwrap();
+    let _ils_unk1 = reader.read_var_int().unwrap();
+    // info!("ILS: length: {} unk1: {}", ils_info.len, ils_unk1);
+    let ils_body_offset = reader.pos;
+
+    let ils_uncomp = reader.read_zlib_bytes(ils_info.len).unwrap();
+    if ils_uncomp.len() != ils_info.uncompressed_len {
+        warn!(
+            "ILS: Expected uncompressed length {} but got length {}",
+            ils_info.uncompressed_len,
+            ils_uncomp.len()
+        );
+    }
+
+    let mut ils_reader = BinaryReader::from_vec(&ils_uncomp);
+    ils_reader.set_endian(reader.endian);
+
+    while !ils_reader.eof() {
+        let res_id = ils_reader.read_var_int().unwrap() as u32;
+        let info = chunk_info.get(&res_id).unwrap();
+
+        // info!("Loading ILS resource {}: '{}', {} bytes", res_id, fourcc_to_string(info.fourcc), info.len);
+        cached_chunk_views.insert(res_id, ils_reader.read_bytes(info.len).unwrap().to_vec());
+    }
+
+    return Ok(ils_body_offset);
+}
+
+fn read_memory_map(
+    reader: &mut BinaryReader,
+    chunk_info: &mut HashMap<u32, ChunkInfo>,
+) -> Result<(), String> {
+    // Read imap chunk header
+    let imap_fourcc = reader.read_u32().unwrap();
+    if imap_fourcc != FOURCC("imap") {
+        return Err(format!(
+            "read_memory_map: Expected 'imap' but got '{}'",
+            fourcc_to_string(imap_fourcc)
+        ));
+    }
+    let _imap_length = reader.read_u32().unwrap();
+
+    // imap body: count (u32), mmapOffset (u32)
+    let imap_count = reader.read_u32().unwrap();
+    let mmap_offset = reader.read_u32().unwrap() as usize;
+
+    console_warn!(
+        "read_memory_map: imap count={} mmapOffset=0x{:x}",
+        imap_count, mmap_offset
+    );
+
+    // Seek to mmap
+    reader.jmp(mmap_offset);
+
+    let mmap_fourcc = reader.read_u32().unwrap();
+    if mmap_fourcc != FOURCC("mmap") {
+        return Err(format!(
+            "read_memory_map: Expected 'mmap' at offset 0x{:x} but got '{}'",
+            mmap_offset, fourcc_to_string(mmap_fourcc)
+        ));
+    }
+    let _mmap_length = reader.read_u32().unwrap();
+
+    // mmap header
+    let header_size = reader.read_u16().unwrap();
+    let entry_size = reader.read_u16().unwrap();
+    let _chunk_count_max = reader.read_u32().unwrap();
+    let chunk_count_used = reader.read_u32().unwrap();
+    let _junk_head_a = reader.read_u32().unwrap(); // 0xFFFFFFFF
+    let _junk_head_b = reader.read_u32().unwrap(); // 0xFFFFFFFF
+    let _free_head = reader.read_u32().unwrap();
+
+    console_warn!(
+        "read_memory_map: mmap headerSize={} entrySize={} chunkCountUsed={} chunkCountMax={}",
+        header_size, entry_size, chunk_count_used, _chunk_count_max
+    );
+
+    // Skip any extra header bytes beyond the 24 we already read
+    let header_bytes_read: u16 = 24; // 2+2+4+4+4+4+4
+    if header_size > header_bytes_read {
+        let extra = (header_size - header_bytes_read) as usize;
+        reader.read_bytes(extra).unwrap();
+    }
+
+    // Read mmap entries
+    for i in 0..chunk_count_used {
+        let entry_start = reader.pos;
+        let fourcc = reader.read_u32().unwrap();
+        let size = reader.read_u32().unwrap();
+        let offset = reader.read_u32().unwrap() as usize;
+        let _flags = reader.read_u16().unwrap();
+        let _unknown = reader.read_u16().unwrap();
+        let _next = reader.read_u32().unwrap();
+
+        // Skip any extra entry bytes beyond the 20 we already read
+        let entry_bytes_read: u16 = 20; // 4+4+4+2+2+4
+        if entry_size > entry_bytes_read {
+            let extra = (entry_size - entry_bytes_read) as usize;
+            reader.jmp(entry_start + extra);
+        }
+
+        // Include free/junk entries in chunk_info — their data may still be
+        // at the original offset and referenced by the Key Table. The Director
+        // player accesses reclaimed entries when the Key Table still points to them.
+        let info = ChunkInfo {
+            id: i,
+            fourcc,
+            len: size as usize,
+            uncompressed_len: size as usize,
+            offset,
+            compression_id: NULL_COMPRESSION_GUID,
+        };
+        chunk_info.insert(i, info);
+    }
+
+    Ok(())
+}
+
+fn read_key_table(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+) -> Result<KeyTableChunk, String> {
+    let info = get_first_chunk_info(&chunk_container.chunk_info, FOURCC("KEY*"));
+
+    match info {
+        Some(info) => {
+            let key_table = if let Chunk::KeyTable(key_table) =
+                get_chunk(reader, chunk_container, rifx, info.fourcc, info.id).unwrap()
+            {
+                key_table
+            } else {
+                panic!("Not a keytable");
+            };
+
+            for i in 0..key_table.used_count {
+                let entry = &key_table.entries[i as usize];
+                let mut _owner_tag = FOURCC("????");
+                if chunk_container.chunk_info.contains_key(&entry.cast_id) {
+                    _owner_tag = chunk_container
+                        .chunk_info
+                        .get(&entry.cast_id)
+                        .unwrap()
+                        .fourcc;
+                }
+                // info!("KEY* entry ${i}: '{}' @ {} owned by '{}' @ {}", fourcc_to_string(entry.fourcc), entry.section_id, fourcc_to_string(owner_tag), entry.cast_id);
+            }
+            return Ok(key_table);
+        }
+        None => return Err("No key chunk!".to_owned()),
+    }
+}
+
+fn get_first_chunk_info(chunk_info: &HashMap<u32, ChunkInfo>, fourcc: u32) -> Option<&ChunkInfo> {
+    return chunk_info
+        .iter()
+        .find(|x| x.1.fourcc == fourcc)
+        .map(|x| x.1);
+}
+
+fn get_first_chunk(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    fourcc: u32,
+) -> Option<Chunk> {
+    let info = get_first_chunk_info(&chunk_container.chunk_info, fourcc);
+    if let Some(info) = info {
+        let info_fourcc = info.fourcc;
+        let info_id = info.id;
+        match get_chunk(reader, chunk_container, rifx, info_fourcc, info_id) {
+            Ok(chunk) => return Some(chunk),
+            Err(e) => {
+                console_warn!("Failed to read '{}' chunk (id={}): {}", fourcc_to_string(info_fourcc), info_id, e);
+                return None;
+            }
+        }
+    } else {
+        return None;
+    }
+}
+
+fn read_chunk_data(reader: &mut BinaryReader, fourcc: u32, len: u32) -> Result<Vec<u8>, String> {
+    let offset = reader.pos;
+
+    let valid_fourcc = reader.read_u32().unwrap();
+    let valid_len = reader.read_u32().unwrap();
+
+    // use the valid length if mmap hasn't been read yet
+    let mut use_len = len;
+    if len == u32::MAX {
+        use_len = valid_len;
+    }
+
+    // validate chunk - allow null-byte variants (e.g., CAS\0 for CASt)
+    if fourcc != valid_fourcc {
+        let a = fourcc.to_be_bytes();
+        let b = valid_fourcc.to_be_bytes();
+        let close_match = (0..4).all(|i| a[i] == b[i] || a[i] == 0 || b[i] == 0);
+        if !close_match {
+            return Err(format!(
+                "At offset 0x{:x} expected '{}' chunk but got '{}'",
+                offset,
+                fourcc_to_string(fourcc),
+                fourcc_to_string(valid_fourcc),
+            ));
+        }
+    }
+
+    if use_len != valid_len {
+        console_warn!(
+            "read_chunk_data: At offset 0x{:x} '{}' mmap size={} != header size={}, using header size",
+            offset,
+            fourcc_to_string(fourcc),
+            use_len,
+            valid_len,
+        );
+        use_len = valid_len;
+    }
+
+    return Ok(reader.read_bytes(use_len as usize).unwrap().to_vec());
+}
+
+pub fn read_director_file_bytes(
+    bytes: &Vec<u8>,
+    file_name: &str,
+    base_path: &str,
+) -> Result<DirectorFile, String> {
+    let mut reader = binary_reader::BinaryReader::from_vec(bytes);
+
+    return DirectorFile::read(
+        file_name.to_owned(),
+        Url::from_str(base_path).unwrap(),
+        &mut reader,
+    );
+}
+
+fn get_chunk_data(
+    reader: &mut BinaryReader,
+    chunk_container: &mut ChunkContainer,
+    rifx: &RIFXReaderContext,
+    fourcc: u32,
+    id: u32,
+) -> Result<Vec<u8>, String> {
+    // let chunk_info = &mut self.chunk_info;
+    // let cached_chunk_views = &self.cached_chunk_views;
+    // let ils_body_offset = self.ils_body_offset;
+    // let after_burned = self.after_burned;
+    match chunk_container.chunk_info.get(&id) {
+        Some(info) => {
+            // Allow chunks where the FOURCC has a null byte replacing a character
+            // (e.g., CAS\0 matching CASt). Some Director files use null-terminated FOURCCs.
+            // Also allow "free"/"junk" entries — the data may still be valid at the
+            // original offset even though the mmap slot was reclaimed.
+            let is_reclaimed = info.fourcc == FOURCC("free") || info.fourcc == FOURCC("junk");
+            let fourcc_match = if is_reclaimed {
+                true // Trust the Key Table's fourcc over the mmap's "free"/"junk" marker
+            } else if fourcc != info.fourcc {
+                // Mask: if either FOURCC has a zero byte in any position, ignore that position
+                let a = fourcc.to_be_bytes();
+                let b = info.fourcc.to_be_bytes();
+                let mut match_count = 0;
+                for i in 0..4 {
+                    if a[i] == b[i] || a[i] == 0 || b[i] == 0 {
+                        match_count += 1;
+                    }
+                }
+                match_count == 4
+            } else {
+                true
+            };
+            if !fourcc_match {
+                return Err(format_args!(
+                    "At offset 0x{:x} expected '{}' chunk but got '{}'",
+                    id,
+                    fourcc_to_string(fourcc),
+                    fourcc_to_string(info.fourcc)
+                )
+                .to_string());
+            }
+
+            if chunk_container.cached_chunk_views.contains_key(&id) {
+                return Ok(chunk_container
+                    .cached_chunk_views
+                    .get(&id)
+                    .unwrap()
+                    .to_vec());
+            } else if rifx.after_burned {
+                reader.jmp(info.offset + rifx.ils_body_offset);
+                if info.len == 0 && info.uncompressed_len == 0 {
+                    chunk_container
+                        .cached_chunk_views
+                        .insert(id, reader.read_bytes(info.len)
+                            .map_err(|e| format!("Chunk {}: failed to read empty chunk: {}", id, e))?
+                            .to_vec());
+                } else if compression_implemented(&info.compression_id) {
+                    let mut uncomp_buf: Option<Vec<u8>> = None;
+                    if info.compression_id == ZLIB_COMPRESSION_GUID
+                        || info.compression_id == ZLIB_COMPRESSION_GUID2
+                    {
+                        uncomp_buf = Some(reader.read_zlib_bytes(info.len)
+                            .map_err(|e| format!("Chunk {}: zlib decompression failed: {}", id, e))?);
+                    } else if info.compression_id == SND_COMPRESSION_GUID {
+                        // Handle Director SND compressed chunk
+                        reader.jmp(info.offset + rifx.ils_body_offset);
+
+                        // Read raw bytes for this chunk
+                        let snd_bytes = reader
+                            .read_bytes(info.len)
+                            .map_err(|e| format!("Failed to read SND chunk bytes: {}", e))?
+                            .to_vec();
+
+                        // Create a temporary BinaryReader over those bytes
+                        let mut chunk_reader = BinaryReader::from_vec(&snd_bytes);
+                        chunk_reader.endian = Endian::Big;
+
+                        // Try to parse into a SoundChunk (your code)
+                        match SoundChunk::from_snd_chunk(&mut chunk_reader, 0) {
+                            Ok(sound_chunk) => {
+                                let wav_bytes = sound_chunk.to_wav(); // convert to usable PCM
+                                chunk_container
+                                    .cached_chunk_views
+                                    .insert(id, wav_bytes.clone());
+                                return Ok(wav_bytes);
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse SND chunk {}: {}", id, e);
+                                // fallback: just insert the raw bytes to avoid crash
+                                chunk_container
+                                    .cached_chunk_views
+                                    .insert(id, snd_bytes.to_vec());
+                                return Ok(snd_bytes.to_vec());
+                            }
+                        }
+                    }
+                    if uncomp_buf.is_none() {
+                        return Err(format!("Chunk ${id}: Could not decompress").to_string());
+                    }
+                    let uncomp_buf = uncomp_buf.unwrap();
+                    if uncomp_buf.len() != info.uncompressed_len {
+                        return Err(format_args!(
+                            "Chunk ${id}: Expected uncompressed length {} but got length {}",
+                            info.uncompressed_len,
+                            uncomp_buf.len()
+                        )
+                        .to_string());
+                    }
+                    chunk_container
+                        .cached_chunk_views
+                        .insert(id, uncomp_buf.to_vec());
+                } else if info.compression_id == FONTMAP_COMPRESSION_GUID {
+                    // Non-fatal: the chunk is stored raw and load continues.
+                    // debug!, not warn! — fires per FONTMAP chunk on load and
+                    // floods the browser console (which retains every entry).
+                    debug!(
+                        "FONTMAP compression not implemented — skipping chunk {}",
+                        id
+                    );
+
+                    // Read and store raw bytes instead of panicking
+                    let raw = reader
+                        .read_bytes(info.len)
+                        .map_err(|e| format!("Failed to read FONTMAP chunk {}: {}", id, e))?
+                        .to_vec();
+
+                    chunk_container.cached_chunk_views.insert(id, raw.clone());
+                    return Ok(raw);
+                } else {
+                    // NULL = uncompressed; SWA = Shockwave Audio (MP3) members,
+                    // whose compressed bytes are correctly stored raw for the
+                    // sound decoder. Both are expected here — only warn for a
+                    // genuinely-unknown codec (and even then load continues with
+                    // the raw bytes, so it's non-fatal).
+                    if info.compression_id != NULL_COMPRESSION_GUID
+                        && info.compression_id != SWA_COMPRESSION_GUID
+                        && info.compression_id != SWA_COMPRESSION_GUID2
+                    {
+                        warn!("Unhandled compression type {}", info.compression_id)
+                    }
+                    chunk_container
+                        .cached_chunk_views
+                        .insert(id, reader.read_bytes(info.len)
+                            .map_err(|e| format!("Chunk {}: failed to read bytes: {}", id, e))?
+                            .to_vec());
+                }
+            } else {
+                reader.jmp(info.offset);
+                let chunk_data = read_chunk_data(reader, fourcc, u32::MAX)?;
+                chunk_container
+                    .cached_chunk_views
+                    .insert(id, chunk_data);
+            }
+
+            return Ok(chunk_container
+                .cached_chunk_views
+                .get(&id)
+                .unwrap()
+                .to_vec());
+        }
+        None => {
+            Err(format_args!("Could not find chunk {} ${id}", fourcc_to_string(fourcc)).to_string())
+        }
+    }
+}
+
+pub fn get_chunk(
+    reader: &mut BinaryReader,
+    // endian: Endian,
+    chunk_container: &mut ChunkContainer,
+    rifx: &mut RIFXReaderContext,
+    fourcc: u32,
+    id: u32,
+) -> Result<Chunk, String> {
+    // if deserialized_chunks.contains_key(&id) {
+    //   return deserialized_chunks.get(&id).unwrap();
+    // }
+
+    let chunk_view = get_chunk_data(reader, chunk_container, rifx, fourcc, id);
+    if let Ok(chunk_view) = chunk_view {
+        let chunk = make_chunk(reader.endian, rifx, fourcc, &chunk_view);
+        return chunk;
+    } else {
+        // warn!("Could not find chunk data for chunk {} of id {}", fourcc_to_string(fourcc), id);
+        Err(chunk_view.unwrap_err())
+    }
+    // deserialized_chunks.insert(id, chunk);
+    // return deserialized_chunks.get(&id).unwrap();
+}
+
+pub fn get_children_of_chunk<'a>(
+    chunk_id: &u32,
+    key_table: &'a KeyTableChunk,
+) -> Vec<&'a KeyTableEntry> {
+    let associations = key_table.entries.iter().filter(|x| x.cast_id == *chunk_id);
+    return associations.collect_vec();
+}
+
+fn compression_implemented(compression_id: &MoaID) -> bool {
+    return *compression_id == ZLIB_COMPRESSION_GUID
+        || *compression_id == ZLIB_COMPRESSION_GUID2
+        || *compression_id == SND_COMPRESSION_GUID;
+}

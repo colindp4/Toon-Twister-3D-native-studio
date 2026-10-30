@@ -1,0 +1,736 @@
+use std::collections::VecDeque;
+
+use log::debug;
+
+use crate::player::datum_formatting::format_concrete_datum;
+use crate::player::symbols::builtin::BuiltInSymbol;
+use crate::player::symbols::symbol::Symbol;
+use crate::symbol_match;
+use crate::{
+    director::lingo::datum::{datum_bool, Datum},
+    player::{
+        allocator::{DatumAllocator, DatumAllocatorTrait},
+        compare::{datum_equals, datum_less_than},
+        handlers::types::TypeUtils,
+        player_duplicate_datum, reserve_player_mut, reserve_player_ref, DatumRef, DirPlayer,
+        ScriptError,
+    },
+};
+
+pub struct ListDatumHandlers {}
+pub struct ListDatumUtils {}
+
+impl ListDatumUtils {
+    fn find_index_to_add(
+        list_vec: &VecDeque<DatumRef>,
+        item: &DatumRef,
+        allocator: &DatumAllocator,
+    ) -> Result<i32, ScriptError> {
+        let mut low = 0;
+        let mut high = list_vec.len() as i32;
+        let item = allocator.get_datum(item);
+
+        while low < high {
+            let mid = (low + high) / 2;
+            let left = allocator.get_datum(list_vec.get(mid as usize).unwrap());
+            if datum_less_than(left, item, &allocator)? {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        Ok(low)
+    }
+
+    pub fn get_prop(
+        list_vec: &VecDeque<DatumRef>,
+        prop_name: Symbol,
+        _datums: &DatumAllocator,
+    ) -> Result<Datum, ScriptError> {
+        // `into_builtin()` rather than `into_builtin_or_error()`: a symbol that
+        // is not a builtin is simply a property this list does not have, which
+        // is the VOID case below, not an error.
+        match prop_name.into_builtin() {
+            Some(BuiltInSymbol::Count) => Ok(Datum::Int(list_vec.len() as i32)),
+            Some(BuiltInSymbol::Length) => Ok(Datum::Int(list_vec.len() as i32)),
+            Some(BuiltInSymbol::Ilk) => Ok(Datum::Symbol(Symbol::builtin(BuiltInSymbol::List))),
+            // `propertyList.propertyName` is a documented spelling of getaProp,
+            // and "the getaProp command returns VOID when the specified value is
+            // not in the list" — only BRACKET access raises: "Unlike the
+            // getAProp command where VOID is returned when a property doesn't
+            // exist, a script error will occur if the property doesn't exist
+            // when using bracket access" (Director 11.5 Scripting Dictionary,
+            // `getaProp`). Erroring here had it backwards.
+            //
+            // A LINEAR list reaching this arm is the same question asked of a
+            // list that simply has no such property, so it answers the same way.
+            // Argent Free Ride's Track Builder leans on it directly: when its
+            // track XML yields no attributes, `pAttributes.skydome` is expected
+            // to come back VOID, and the very next lines guard with
+            // `voidp(pAttributes.findPos(#terrain_sx))`.
+            _ => Ok(Datum::Void),
+        }
+    }
+}
+
+impl ListDatumHandlers {
+    pub fn get_prop(
+        player: &mut DirPlayer,
+        datum_ref: &DatumRef,
+        prop_name: Symbol,
+    ) -> Result<DatumRef, ScriptError> {
+        // Director: every datum has a `string` property returning its
+        // textual representation. For lists this is the bracketed literal
+        // form `[item1, item2, item3]` (with strings quoted, symbols `#sym`,
+        // nested lists recursed). Used by Habbo / spineworld idioms like
+        // `appearanceToString` (MovieScript 2 global events line 299) that
+        // do `inList.string` then strip `[`, `]`, spaces to serialise an
+        // appearance list into a flat custom-delimited string.
+        if prop_name.as_str().eq_ignore_ascii_case("string") {
+            let datum_clone = player.get_datum(datum_ref).clone();
+            let s = format_concrete_datum(&datum_clone, player);
+            return Ok(player.alloc_datum(Datum::String(s)));
+        }
+        let list_vec = player.get_datum(datum_ref).to_list()?;
+        let result = ListDatumUtils::get_prop(&list_vec, prop_name, &player.allocator)?;
+        Ok(player.alloc_datum(result))
+    }
+
+    pub fn get_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (list_type, list_vec, _) = player.get_datum(datum).to_list_tuple()?;
+            // A VOID index (e.g. `list[uninitializedGlobal]`) yields VOID in Director
+            // rather than raising — real movies rely on this (leo3d's checkbonbon does
+            // `SetObjectVisible(pbonbon[weg], 0)` with `weg` VOID before any is collected).
+            if matches!(player.get_datum(&args[0]), Datum::Void) {
+                return Ok(DatumRef::Void);
+            }
+            let index_value = player.get_datum(&args[0]).int_value()?;
+
+            // Handle different indexing schemes based on list type
+            let position = match list_type {
+                crate::director::lingo::datum::DatumType::XmlChildNodes => {
+                    // XML childNodes use 0-based indexing (like JavaScript/DOM)
+                    index_value
+                }
+                _ => {
+                    // Regular Lingo lists use 1-based indexing
+                    index_value - 1
+                }
+            };
+
+            if position < 0 || position >= list_vec.len() as i32 {
+                let base = format!(
+                    "List index {} out of bounds (list has {} items)",
+                    position + 1,
+                    list_vec.len()
+                );
+                // Keep empty-list startup failures actionable in legacy movies:
+                // include the Lingo frames and their locals so a bad member
+                // lookup (e.g. Text Xtra line data) can be distinguished from
+                // a constructor/argument issue without guessing from the opcode.
+                if list_vec.is_empty() {
+                    let current = crate::player::mcp::mcp_get_context(player);
+                    // Include enough caller frames to expose constructor
+                    // locals such as `strMname` when a Director group indexes
+                    // its empty `groupmembers` list.
+                    let stack = crate::player::mcp::mcp_get_call_stack(player, Some(8), true);
+                    let details: String = stack.chars().take(9000).collect();
+                    return Err(ScriptError::new(format!(
+                        "{base}\nCurrent instruction:\n{current}\nLingo context:\n{details}"
+                    )));
+                }
+                return Err(ScriptError::new(format!(
+                    "{base}"
+                )));
+            }
+
+            let result = list_vec[position as usize].clone();
+            Ok(result)
+        })
+    }
+
+    pub fn set_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let position = player.get_datum(&args[0]).int_value()?;
+            let (_, list_vec, ..) = player.get_datum_mut(datum).to_list_mut()?;
+            let index = position - 1;
+            let item_ref = &args[1];
+
+            // Non-positive positions: `index < list_vec.len()` is true for a
+            // negative index, so without this guard `list_vec[(-1) as usize]`
+            // indexes with a huge value and VecDeque panics (crashing the whole
+            // VM). Director's lists are 1-based and it tolerates setAt at
+            // position <= 0 as a no-op rather than erroring — spectral-wizard's
+            // generic `customHyperlink` behavior relies on this with
+            // `pVisited[pHyperLinks.count] = 0` when a member has no links
+            // (count 0 → `pVisited[0] = 0`). Silently ignore.
+            if index < 0 {
+                return Ok(DatumRef::Void);
+            }
+
+            if index < list_vec.len() as i32 {
+                list_vec[index as usize] = item_ref.clone();
+            } else {
+                let padding_size = index - list_vec.len() as i32;
+                for _ in 0..padding_size {
+                    // TODO: should this be filled with zeroes instead?
+                    list_vec.push_back(DatumRef::Void);
+                }
+                list_vec.push_back(item_ref.clone());
+            }
+            player.note_actor_list_mutation(datum);
+            player.note_script_instance_list_mutation(datum);
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn call(
+        datum: &DatumRef,
+        handler_name: Symbol,
+        args: &Vec<DatumRef>,
+    ) -> Result<DatumRef, ScriptError> {
+        match handler_name.into_builtin() {
+            Some(BuiltInSymbol::Count) => Self::count(datum, args),
+            Some(BuiltInSymbol::GetAt) => Self::get_at(datum, args),
+            Some(BuiltInSymbol::SetAt) => Self::set_at(datum, args),
+            Some(BuiltInSymbol::Sort) => Self::sort(datum, args),
+            Some(BuiltInSymbol::GetOne) => Self::get_one(datum, args),
+            Some(BuiltInSymbol::Add) => Self::add(datum, args),
+            Some(BuiltInSymbol::Duplicate) => Self::duplicate(datum, args),
+            Some(BuiltInSymbol::AddAt) => Self::add_at(datum, args),
+            Some(BuiltInSymbol::GetLast) => Self::get_last(datum, args),
+            Some(BuiltInSymbol::Append | BuiltInSymbol::Push) => Self::append(datum, args),
+            Some(BuiltInSymbol::DeleteOne) => Self::delete_one(datum, args),
+            Some(BuiltInSymbol::DeleteAt) => Self::delete_at(datum, args),
+            Some(BuiltInSymbol::DeleteAll) => Self::delete_all(datum, args),
+            Some(BuiltInSymbol::FindPos) => Self::find_pos(datum, args),
+            Some(BuiltInSymbol::GetPos) => Self::get_one(datum, args),
+            Some(BuiltInSymbol::FindPosNear) => Self::find_pos_near(datum, args),
+            //"getPos" => Self::find_pos(datum, args), TODO: Check which getPos is correct
+            Some(BuiltInSymbol::Join) => Self::join(datum, args),
+            Some(BuiltInSymbol::GetPropRef | BuiltInSymbol::GetProp) => Self::get_prop_ref(datum, args),
+            Some(BuiltInSymbol::ToString) => {
+                Ok(reserve_player_mut(|player| {
+                    let s = crate::player::datum_formatting::format_datum(datum, player);
+                    player.alloc_datum(Datum::String(s))
+                }))
+            },
+            Some(BuiltInSymbol::GetTypeOf) => {
+                // Flash objects have getTypeOf() for error checking.
+                // A list is never an error type, so return empty string.
+                Ok(reserve_player_mut(|player| {
+                    player.alloc_datum(Datum::String("".to_string()))
+                }))
+            },
+            Some(BuiltInSymbol::Max) => Self::max(datum, args),
+            Some(BuiltInSymbol::Min) => Self::min(datum, args),
+            // Director matrix methods (chapter 15): when a list-of-lists is
+            // used as a matrix (the layout `newMatrix` produces), `setVal`
+            // and `getVal` access cells by 1-based (row, col) indices.
+            // Director's API is `matrix.setVal(row, col, value)` — extra
+            // trailing arguments are silently ignored (some scripts pass a
+            // 4th arg that's a leftover from copy-paste; e.g. the Batman
+            // terrain script's `myMatrix.setVal(b+1, a+1, h, y)` — we drop the
+            // `y` to match Director's tolerant behaviour).
+            Some(BuiltInSymbol::SetVal) => Self::set_val(datum, args),
+            Some(BuiltInSymbol::GetVal) => Self::get_val(datum, args),
+            _ => Err(ScriptError::new(format!(
+                "No handler {handler_name} for list datum"
+            ))),
+        }
+    }
+
+    /// `matrix.setVal(row, col, value [, ignored…])` — 1-based, row-major.
+    pub fn set_val(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            if args.len() < 3 {
+                return Err(ScriptError::new(
+                    "setVal requires (row, col, value)".to_string(),
+                ));
+            }
+            let row = player.get_datum(&args[0]).int_value()? - 1;
+            let col = player.get_datum(&args[1]).int_value()? - 1;
+            let value_ref = args[2].clone();
+            if row < 0 || col < 0 {
+                return Err(ScriptError::new(format!(
+                    "setVal: row/col must be 1-based positive (got {}, {})",
+                    row + 1, col + 1
+                )));
+            }
+            // Look up the row reference.
+            let row_ref = {
+                let (_, list_vec, _) = player.get_datum(datum).to_list_tuple()?;
+                if (row as usize) >= list_vec.len() {
+                    return Err(ScriptError::new(format!(
+                        "setVal: row {} out of range (matrix has {} rows)",
+                        row + 1, list_vec.len()
+                    )));
+                }
+                list_vec[row as usize].clone()
+            };
+            // Mutate the inner row.
+            let (_, row_vec, _) = player.get_datum_mut(&row_ref).to_list_mut()?;
+            if (col as usize) >= row_vec.len() {
+                return Err(ScriptError::new(format!(
+                    "setVal: col {} out of range (row has {} cols)",
+                    col + 1, row_vec.len()
+                )));
+            }
+            row_vec[col as usize] = value_ref;
+            player.note_actor_list_mutation(datum);
+            player.note_script_instance_list_mutation(datum);
+            Ok(DatumRef::Void)
+        })
+    }
+
+    /// `matrix.getVal(row, col)` — 1-based, row-major.
+    pub fn get_val(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            if args.len() < 2 {
+                return Err(ScriptError::new(
+                    "getVal requires (row, col)".to_string(),
+                ));
+            }
+            let row = player.get_datum(&args[0]).int_value()? - 1;
+            let col = player.get_datum(&args[1]).int_value()? - 1;
+            let (_, list_vec, _) = player.get_datum(datum).to_list_tuple()?;
+            if row < 0 || (row as usize) >= list_vec.len() {
+                return Err(ScriptError::new(format!(
+                    "getVal: row {} out of range (matrix has {} rows)",
+                    row + 1, list_vec.len()
+                )));
+            }
+            let row_ref = list_vec[row as usize].clone();
+            let (_, row_vec, _) = player.get_datum(&row_ref).to_list_tuple()?;
+            if col < 0 || (col as usize) >= row_vec.len() {
+                return Err(ScriptError::new(format!(
+                    "getVal: col {} out of range (row has {} cols)",
+                    col + 1, row_vec.len()
+                )));
+            }
+            Ok(row_vec[col as usize].clone())
+        })
+    }
+
+    pub fn max(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let list_vec = player.get_datum(datum).to_list()?;
+            if list_vec.is_empty() {
+                return Ok(DatumRef::Void);
+            }
+            let mut max_item = list_vec[0].clone();
+            for item_ref in list_vec.iter().skip(1) {
+                let item = player.get_datum(item_ref);
+                let current_max = player.get_datum(&max_item);
+                if datum_less_than(current_max, item, &player.allocator)? {
+                    max_item = item_ref.clone();
+                }
+            }
+            Ok(max_item)
+        })
+    }
+
+    pub fn min(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let list_vec = player.get_datum(datum).to_list()?;
+            if list_vec.is_empty() {
+                return Ok(DatumRef::Void);
+            }
+            let mut min_item = list_vec[0].clone();
+            for item_ref in list_vec.iter().skip(1) {
+                let item = player.get_datum(item_ref);
+                let current_min = player.get_datum(&min_item);
+                if datum_less_than(item, current_min, &player.allocator)? {
+                    min_item = item_ref.clone();
+                }
+            }
+            Ok(min_item)
+        })
+    }
+
+    pub fn get_prop_ref(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        if args.is_empty() {
+            return Err(ScriptError::new(
+                "getPropRef requires at least one argument".to_string(),
+            ));
+        }
+
+        let key = args[0].clone();
+
+        let result = reserve_player_mut(|player| {
+            let items = player.get_datum(datum).to_list()?;
+            let index = player.get_datum(&key).int_value()?;
+
+            // Support both 0-based and 1-based indexing
+            let actual_index = if index == 0 {
+                0
+            } else if index >= 1 {
+                (index - 1) as usize
+            } else {
+                return Err(ScriptError::new(format!("Index out of bounds: {}", index)));
+            };
+
+            if actual_index >= items.len() {
+                return Err(ScriptError::new(format!("Index out of bounds: {}", index)));
+            }
+
+            let result = items[actual_index].clone();
+            // If there are more keys AND the first arg was an int (nested indexing like list[a][b]),
+            // recursively resolve. Don't sub-index when args[0] was a symbol (#prop, index) pattern.
+            if args.len() >= 2 && player.get_datum(&args[0]).is_int() {
+                TypeUtils::get_sub_prop(&result, &args[1], player)
+            } else {
+                Ok(result)
+            }
+        });
+
+        result
+    }
+
+    fn count(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let list_vec = player.get_datum(datum).to_list()?;
+            Ok(player.alloc_datum(Datum::Int(list_vec.len() as i32)))
+        })
+    }
+
+    fn get_last(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let list_vec = player.get_datum(datum).to_list()?;
+            let last = list_vec.back().map(|x| x.clone()).unwrap_or(DatumRef::Void);
+            Ok(last)
+        })
+    }
+
+    pub fn get_one(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let find = player.get_datum(&args[0]);
+            let list_vec = player.get_datum(datum).to_list()?;
+            let position = list_vec
+                .iter()
+                .position(|x| datum_equals(player.get_datum(&x), find, &player.allocator).unwrap())
+                .map(|x| x as i32);
+
+            Ok(player.alloc_datum(Datum::Int(position.unwrap_or(-1) + 1)))
+        })
+    }
+
+    pub fn find_pos(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        // TODO: why is this exactly the same as get_one?
+        reserve_player_mut(|player| {
+            let find = player.get_datum(&args[0]);
+            let list_vec = player.get_datum(datum).to_list()?;
+            let position = list_vec
+                .iter()
+                .position(|x| datum_equals(player.get_datum(&x), find, &player.allocator).unwrap())
+                .map(|x| x as i32);
+            let result = position.unwrap_or(-1) + 1;
+
+            Ok(player.alloc_datum(Datum::Int(result)))
+        })
+    }
+
+    pub fn find_pos_near(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (_, list_vec, is_sorted) = player.get_datum(datum).to_list_tuple()?;
+            if is_sorted {
+                let pos = ListDatumUtils::find_index_to_add(&list_vec, &args[0], &player.allocator)?;
+                Ok(player.alloc_datum(Datum::Int(pos + 1)))
+            } else {
+                let find = player.get_datum(&args[0]);
+                let position = list_vec
+                    .iter()
+                    .position(|x| datum_equals(player.get_datum(&x), find, &player.allocator).unwrap())
+                    .map(|x| x as i32);
+                let result = position.unwrap_or(-1) + 1;
+                Ok(player.alloc_datum(Datum::Int(result)))
+            }
+        })
+    }
+
+    pub fn add(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let datum_value = player.get_datum(datum);
+            if datum_value.is_void() {
+                return Ok(DatumRef::Void);
+            }
+            if args.is_empty() {
+                // add() with no args — used by meshDeform.mesh[m].textureLayer.add()
+                // Find the meshDeform context for this list to create proper meshDeformTexLayer refs
+                let tex_layer_context: Option<(i32, i32, Symbol, usize)> = {
+                    let mut found = None;
+                    for cast in &player.movie.cast_manager.casts {
+                        for (member_num, member) in &cast.members {
+                            if let Some(w3d) = member.member_type.as_shockwave3d() {
+                                for (model_name, md) in &w3d.runtime_state.mesh_deform {
+                                    for (mesh_idx, mesh) in md.meshes.iter().enumerate() {
+                                        if let Some(ref list_ref) = mesh.texture_layer_datum_ref {
+                                            if *list_ref == *datum {
+                                                found = Some((cast.number as i32, *member_num as i32, model_name.clone(), mesh_idx));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if found.is_some() { break; }
+                    }
+                    found
+                };
+
+                // Debug: log context search result
+                debug!(
+                    "[W3D-ADD] add() no-args on list datum_id={} context={:?}",
+                    datum.unwrap(), tex_layer_context
+                );
+
+                if let Some((cast_lib, cast_member, model_name, mesh_idx)) = tex_layer_context {
+                    // Get current layer count to determine the new layer index
+                    let new_layer_idx = {
+                        let d = player.get_datum(datum);
+                        if let Datum::List(_, items, _) = d { items.len() } else { 0 }
+                    };
+                    // Create a meshDeformTexLayer ref so set_prop dispatches correctly
+                    use crate::director::lingo::datum::Shockwave3dObjectRef;
+                    let tex_layer_ref = player.alloc_datum(Datum::Shockwave3dObjectRef(Shockwave3dObjectRef {
+                        cast_lib,
+                        cast_member,
+                        object_type: BuiltInSymbol::MeshDeformTexLayer,
+                        name: Symbol::from_str(&format!("{}:{}:{}", model_name, mesh_idx, new_layer_idx)),
+                    }));
+                    let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+                    list_vec.push_back(tex_layer_ref);
+                } else {
+                    // Fallback: generic PropList (non-textureLayer list)
+                    let key = player.alloc_datum(Datum::Symbol(Symbol::builtin(BuiltInSymbol::TextureCoordinateList)));
+                    let val = player.alloc_datum(Datum::List(
+                        crate::director::lingo::datum::DatumType::List, VecDeque::new(), false,
+                    ));
+                    let prop_list = player.alloc_datum(Datum::PropList(VecDeque::from(vec![(key, val)]), false));
+                    let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+                    list_vec.push_back(prop_list);
+                }
+                player.note_actor_list_mutation(datum);
+                player.note_script_instance_list_mutation(datum);
+                return Ok(DatumRef::Void);
+            }
+
+            let item = &args[0];
+            let (_, list_vec, is_sorted) = player.get_datum(datum).to_list_tuple()?;
+            let index_to_add = if is_sorted {
+                ListDatumUtils::find_index_to_add(&list_vec, &item, &player.allocator)?
+            } else {
+                list_vec.len() as i32
+            };
+
+            let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+            if is_sorted {
+                list_vec.insert(index_to_add as usize, item.clone());
+            } else {
+                list_vec.push_back(item.clone());
+            }
+            player.note_actor_list_mutation(datum);
+            player.note_script_instance_list_mutation(datum);
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn delete_one(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        let index = reserve_player_ref(|player| {
+            let search_ref = &args[0];
+            let item = player.get_datum(search_ref);
+            let list_vec = player.get_datum(datum).to_list()?;
+            let index = list_vec.iter().enumerate().find_map(|(i, list_item_ref)| {
+                // For script instances and other reference types, check reference equality first
+                // Direct reference comparison (important for deleteOne(me) in scripts)
+                if list_item_ref == search_ref {
+                    return Some(i);
+                }
+
+                // Fallback to value equality for other types
+                let list_item = player.get_datum(list_item_ref);
+                if datum_equals(list_item, item, &player.allocator).unwrap_or(false) {
+                    Some(i)
+                } else {
+                    None
+                }
+            });
+            Ok(index)
+        })?;
+
+        reserve_player_mut(|player| {
+            let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+            if let Some(index) = index {
+                if index == 0 {
+                    list_vec.pop_front();
+                } else if index == list_vec.len() - 1 {
+                    list_vec.pop_back();
+                } else {
+                    list_vec.remove(index);
+                }
+                player.note_actor_list_mutation(datum);
+                player.note_script_instance_list_mutation(datum);
+            }
+            Ok(player.alloc_datum(datum_bool(index.is_some())))
+        })
+    }
+
+    pub fn delete_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let position = player.get_datum(&args[0]).int_value()?;
+            let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+            if position <= list_vec.len() as i32 {
+                let index = (position - 1) as usize;
+                // Use pop_front/pop_back for endpoints — O(1) on VecDeque
+                // vs O(n) for remove() which shifts elements.
+                if index == 0 {
+                    list_vec.pop_front();
+                } else if index == list_vec.len() - 1 {
+                    list_vec.pop_back();
+                } else {
+                    list_vec.remove(index);
+                }
+                player.note_actor_list_mutation(datum);
+                player.note_script_instance_list_mutation(datum);
+                Ok(DatumRef::Void)
+            } else {
+                Err(ScriptError::new("Index out of bounds".to_string()))
+            }
+        })
+    }
+
+    pub fn delete_all(datum: &DatumRef, _args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+            list_vec.clear();
+            player.note_actor_list_mutation(datum);
+            player.note_script_instance_list_mutation(datum);
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn add_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let datum_value = player.get_datum(datum);
+            // Return void gracefully if datum is void or not a list
+            // Director typically silently fails rather than erroring on wrong types
+            if datum_value.is_void() {
+                return Ok(DatumRef::Void);
+            }
+
+            // Check if it's actually a list before trying to mutate
+            if !matches!(datum_value, Datum::List(..)) {
+                return Ok(DatumRef::Void);
+            }
+
+            // Director 11.5 spec (p.255) documents addAt(position, value) with
+            // both args required, but the shipped runtime silently accepts the
+            // one-arg form `list.addAt(value)` and treats it as append, for any
+            // value type (int / string / list / etc.) and even on []. Verified
+            // in Director's message window. Habbo's spineworld_dcr Docs script
+            // `getXMLItem` relies on this: `tList.addAt(tAdd)` in a repeat loop.
+            let (position, item_ref) = if args.len() == 1 {
+                let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+                (list_vec.len(), args[0].clone())
+            } else {
+                let pos = player.get_datum(&args[0]).int_value()? - 1;
+                (pos.max(0) as usize, args[1].clone())
+            };
+
+            let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+            let clamped = position.min(list_vec.len());
+            list_vec.insert(clamped, item_ref);
+            player.note_actor_list_mutation(datum);
+            player.note_script_instance_list_mutation(datum);
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn append(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let datum_value = player.get_datum(datum);
+            if datum_value.is_void() {
+                return Ok(DatumRef::Void);
+            }
+            
+            let item = &args[0];
+            let (_, list_vec, _) = player.get_datum_mut(datum).to_list_mut()?;
+            list_vec.push_back(item.clone());
+            player.note_actor_list_mutation(datum);
+            player.note_script_instance_list_mutation(datum);
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn sort(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        let sorted_list = reserve_player_ref(|player| {
+            let list_vec = player.get_datum(datum).to_list()?;
+            let mut sorted_list = list_vec.clone();
+            sorted_list.make_contiguous().sort_by(|a, b| {
+                let left = player.get_datum(a);
+                let right = player.get_datum(b);
+
+                if datum_equals(left, right, &player.allocator).unwrap() {
+                    return std::cmp::Ordering::Equal;
+                } else if datum_less_than(left, right, &player.allocator).unwrap() {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+
+            Ok(sorted_list)
+        })?;
+
+        reserve_player_mut(|player| {
+            let (_, list_vec, is_sorted) = player.get_datum_mut(datum).to_list_mut()?;
+            list_vec.clear();
+            list_vec.extend(sorted_list);
+            *is_sorted = true;
+            player.note_actor_list_mutation(datum);
+            player.note_script_instance_list_mutation(datum);
+
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn duplicate(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        Ok(player_duplicate_datum(datum))
+    }
+
+    pub fn join(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (_, list_vec, _) = player.get_datum(datum).to_list_tuple()?;
+
+            // Optional delimiter argument
+            // TODO: verify default delimiter
+            let delimiter = if args.len() >= 1 {
+                match player.get_datum(&args[0]) {
+                    Datum::String(s) => s.clone(),
+                    _ => "&".to_string(),
+                }
+            } else {
+                "&".to_string()
+            };
+
+            // Convert each element to string safely without extra quotes
+            let pieces: Vec<String> = list_vec
+                .iter()
+                .map(|item_ref| {
+                    let datum = player.get_datum(item_ref);
+                    match datum {
+                        Datum::String(s) => s.clone(),
+                        Datum::Symbol(sym) => sym.to_string(),
+                        Datum::Int(n) => n.to_string(),
+                        _ => format!("{:?}", format_concrete_datum(&datum, player)),
+                    }
+                })
+                .collect();
+
+            let joined = pieces.join(&delimiter);
+            Ok(player.alloc_datum(Datum::String(joined)))
+        })
+    }
+}

@@ -1,0 +1,1234 @@
+use std::collections::VecDeque;
+
+use log::debug;
+
+use crate::PLAYER_OPT;
+use crate::player::symbols::builtin::BuiltInSymbol;
+use crate::player::symbols::symbol::Symbol;
+use crate::{
+    director::lingo::datum::{datum_bool, Datum, PropListPair},
+    player::{
+        allocator::{DatumAllocator, DatumAllocatorTrait},
+        compare::{datum_equals, datum_less_than},
+        datum_formatting::format_concrete_datum,
+        handlers::types::TypeUtils,
+        player_duplicate_datum, reserve_player_mut, reserve_player_ref, DatumRef, DirPlayer,
+        ScriptError,
+    },
+};
+
+pub struct PropListDatumHandlers {}
+
+pub struct PropListUtils {}
+
+impl PropListUtils {
+    fn find_index_to_add(
+        prop_list: &VecDeque<PropListPair>,
+        item: (&DatumRef, &DatumRef),
+        allocator: &DatumAllocator,
+    ) -> Result<i32, ScriptError> {
+        let mut low = 0;
+        let mut high = prop_list.len() as i32;
+        let key = allocator.get_datum(item.0);
+
+        while low < high {
+            let mid = (low + high) / 2;
+            let left_key = allocator.get_datum(&prop_list.get(mid as usize).unwrap().0);
+            if datum_less_than(left_key, key, &allocator)? {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        Ok(low)
+    }
+
+    /// `is_sorted` is `Datum::PropList`'s own sorted flag — the one maintained
+    /// by `sort`/`addProp`/`setaProp` via `find_index_to_add`.
+    ///
+    /// It matters because the binary search below is only valid on a sorted
+    /// list, and on an UNSORTED one it is pure waste: log2(n) `datum_less_than`
+    /// probes plus a `datum_equals_for_lookup` hit check that cannot succeed,
+    /// and then the full linear scan runs anyway. Prop lists are unsorted
+    /// unless a script sorts them, so that was the normal path for every list
+    /// of 8 or more entries. The flag was available at the call sites and
+    /// simply being dropped on the way in.
+    ///
+    /// Passing `false` is never wrong, only slower on a genuinely sorted list —
+    /// the linear scan is the authoritative answer either way (and returns the
+    /// FIRST match, where the binary search could land on a later duplicate).
+    fn get_key_index(
+        prop_list: &VecDeque<PropListPair>,
+        key: &Datum,
+        allocator: &DatumAllocator,
+        is_sorted: bool,
+    ) -> Result<i32, ScriptError> {
+        if is_sorted && prop_list.len() >= 8 {
+            // Try binary search: find insertion point, then check if the key matches
+            let mut low = 0i32;
+            let mut high = prop_list.len() as i32;
+            while low < high {
+                let mid = (low + high) / 2;
+                let mid_key = allocator.get_datum(&prop_list[mid as usize].0);
+                if datum_less_than(mid_key, key, allocator)? {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            // Binary search found insertion point `low`. Check if key at `low` matches.
+            if (low as usize) < prop_list.len() {
+                let found_key = allocator.get_datum(&prop_list[low as usize].0);
+                if Self::datum_equals_for_lookup(found_key, key, allocator)? {
+                    return Ok(low);
+                }
+            }
+            // Binary search may miss due to mixed key types — fall through to linear scan
+        }
+        // A Symbol key — `obj.foo`, `getaProp(#foo)` — is the overwhelmingly
+        // common lookup, and it reduces to comparing interned ids. Take it
+        // through an inlined scan rather than the generic one below, which
+        // makes an out-of-line `Result`-returning call per entry.
+        if let Datum::Symbol(want) = key {
+            return Ok(Self::symbol_key_index(prop_list, *want, allocator));
+        }
+        for (i, (k, _)) in prop_list.iter().enumerate() {
+            let k_datum = allocator.get_datum(k);
+            if Self::datum_equals_for_lookup(k_datum, key, allocator)? {
+                return Ok(i as i32);
+            }
+        }
+        Ok(-1)
+    }
+
+    /// `get_key_index`'s linear scan, specialised for a Symbol key.
+    ///
+    /// Exactly mirrors `datum_equals_for_lookup(entry_key, Datum::Symbol(want))`:
+    /// symbol keys compare by interned id, string keys by text, and an integer
+    /// key matches a numeric symbol (`#2` finds key `2`). Every other key type
+    /// falls through `datum_equals`' symbol arm to `false`.
+    fn symbol_key_index(
+        prop_list: &VecDeque<PropListPair>,
+        want: Symbol,
+        allocator: &DatumAllocator,
+    ) -> i32 {
+        let want_str = want.as_str();
+        // Hoisted: the integer arm re-parsed the symbol name for every entry.
+        let want_as_int = want_str.parse::<i32>().ok();
+        for (i, (k, _)) in prop_list.iter().enumerate() {
+            let hit = match allocator.get_datum(k) {
+                Datum::Symbol(got) => *got == want,
+                Datum::String(got) => got == want_str,
+                Datum::Int(got) => want_as_int == Some(*got),
+                _ => false,
+            };
+            if hit {
+                return i as i32;
+            }
+        }
+        -1
+    }
+
+    /// Format a prop-list key for an error message WITHOUT a `&DirPlayer`.
+    ///
+    /// The `formatted_key` these lookups used to take was produced eagerly by
+    /// `format_datum` at every call site — a heap allocation and a full format
+    /// on every `getaProp`/`setaProp`, for a string that is only ever read on
+    /// the not-found error path. Keys are symbols, strings or ints in
+    /// practically all real Lingo, none of which need player context; anything
+    /// else gets its type name, which is all the message was worth anyway.
+    pub fn format_key_for_error(key: &Datum) -> String {
+        match key {
+            Datum::Symbol(s) => format!("#{}", s.as_str()),
+            Datum::String(s) => format!("\"{s}\""),
+            Datum::Int(i) => i.to_string(),
+            other => format!("<{}>", other.type_enum().type_str()),
+        }
+    }
+
+    pub fn datum_equals_for_lookup(
+        left: &Datum,
+        right: &Datum,
+        allocator: &DatumAllocator,
+    ) -> Result<bool, ScriptError> {
+        let result = match (left, right) {
+            // Director propList key lookup is CASE-INSENSITIVE. This matters
+            // especially now that Symbols are interned: `as_str()` returns the
+            // FIRST-seen casing of a spur, so `#nodename` can stringify as
+            // "nodeName" if that camelCase form was interned first elsewhere. A
+            // case-sensitive compare then makes `getaProp("nodename")` miss the
+            // `#nodename` key and return VOID (v31 catalogue: "Malformed node
+            // data nodeName"). Compare ASCII-case-insensitively for string and
+            // symbol keys to match Director.
+            // String-vs-String keys stay EXACT. The interning leak this block
+            // works around is a SYMBOL problem (`as_str()` returns a spur's
+            // first-seen casing), so only the mixed string/symbol arms below
+            // need to ignore case. Making plain string keys case-insensitive
+            // too aliases keys a movie means to keep distinct: Habbo v7's
+            // object/window registries are string-keyed, and a lookup that
+            // should miss started hitting a same-name-different-case entry, so
+            // `remove` deleted the wrong one, the "already gone?" guard never
+            // fired, and room teardown (deconstruct -> hideAll -> hideInterface
+            // -> removeWindow -> Window Manager::remove -> Object Manager::remove)
+            // looped until the scope guard tripped. Same hazard `add_timeout`
+            // documents for timeout names.
+            (Datum::String(l), Datum::String(r)) => l == r,
+            (Datum::String(l), Datum::Symbol(r)) => l == r.as_str(),
+            (Datum::Symbol(l), Datum::String(r)) => l.as_str() == r,
+
+            // Handle symbol-to-int comparison (e.g., #2 should match key 2)
+            (Datum::Symbol(s), Datum::Int(i)) | (Datum::Int(i), Datum::Symbol(s)) => {
+                s.as_str().parse::<i32>().ok() == Some(*i)
+            }
+
+            _ => datum_equals(left, right, allocator)?,
+        };
+
+        Ok(result)
+    }
+
+    pub fn get_prop_or_built_in(
+        player: &mut DirPlayer,
+        prop_list: &VecDeque<PropListPair>,
+        key: Symbol,
+        is_sorted: bool,
+    ) -> Result<DatumRef, ScriptError> {
+        // ONE pass with the Symbol form. This used to run the whole lookup
+        // twice — first with `Datum::String(key.to_string())` (a heap
+        // allocation per property read), then again with `Datum::Symbol`. The
+        // String pass was pure waste on a symbol-keyed list, which is nearly
+        // all of them: `datum_less_than` orders symbols by their name, so a
+        // String probe key never matches a Symbol entry in the binary search
+        // and every read fell through to the full O(n) linear scan before the
+        // Symbol pass even started. `datum_equals_for_lookup` already treats
+        // String and Symbol keys as interchangeable (both arms below), so the
+        // single Symbol pass finds string-keyed entries too.
+        let key_index = Self::get_key_index(
+            prop_list,
+            &Datum::Symbol(key.to_owned()),
+            &player.allocator,
+            is_sorted,
+        )?;
+        if key_index >= 0 {
+            return Ok(prop_list[key_index as usize].1.clone());
+        }
+        // Director: `propList.string` returns the bracketed `[#key: val, …]`
+        // representation. Handled here (vs. get_built_in_prop) because
+        // formatting needs the full player context for nested datum lookup.
+        if key.as_str().eq_ignore_ascii_case("string") {
+            let datum_clone = Datum::PropList(prop_list.clone(), false);
+            let s = crate::player::datum_formatting::format_concrete_datum(&datum_clone, player);
+            return Ok(player.alloc_datum(Datum::String(s)));
+        }
+        // Try built-in properties, but return VOID if not found instead of error
+        match Self::get_built_in_prop(prop_list, key) {
+            Ok(datum) => Ok(player.alloc_datum(datum)),
+            Err(_) => Ok(DatumRef::Void), // Return VOID for non-existent properties
+        }
+    }
+
+    pub fn get_built_in_prop(
+        prop_list: &VecDeque<PropListPair>,
+        prop: Symbol,
+    ) -> Result<Datum, ScriptError> {
+        match prop.into_builtin() {
+            Some(BuiltInSymbol::Count) => Ok(Datum::Int(prop_list.len() as i32)),
+            Some(BuiltInSymbol::Ilk) => Ok(Datum::Symbol(Symbol::builtin(BuiltInSymbol::PropList))),
+            _ => {
+                return Err(ScriptError::new(format!(
+                    "Invalid prop list built-in property {}",
+                    prop
+                )))
+            }
+        }
+    }
+
+    pub fn get_prop(
+        prop_list: &VecDeque<PropListPair>,
+        key_ref: &DatumRef,
+        allocator: &DatumAllocator,
+        is_required: bool,
+        is_sorted: bool,
+    ) -> Result<DatumRef, ScriptError> {
+        let key = allocator.get_datum(&key_ref);
+        // First try key-based lookup (works for all types including Int)
+        let key_index = Self::get_key_index(prop_list, key, &allocator, is_sorted)?;
+        if key_index >= 0 {
+            return Ok(prop_list[key_index as usize].1.clone());
+        }
+
+        // If not found and key is an Int, try as positional index
+        if let Datum::Int(position) = key {
+            let index = *position - 1;
+            if index >= 0 && index < prop_list.len() as i32 {
+                return Ok(prop_list[index as usize].1.clone());
+            } else {
+                return Err(ScriptError::new(format!("Index out of range: {}", index)));
+            }
+        }
+        if is_required {
+            return Err(ScriptError::new(format!(
+                "Prop not found: {}",
+                Self::format_key_for_error(key)
+            )));
+        }
+        Ok(DatumRef::Void)
+    }
+
+    pub fn set_prop(
+        prop_list_ref: &DatumRef,
+        key_ref: &DatumRef,
+        value_ref: &DatumRef,
+        player: &mut DirPlayer,
+        is_required: bool,
+    ) -> Result<(), ScriptError> {
+        let key = player.get_datum(key_ref);
+        let (prop_list, is_sorted) = player.get_datum(prop_list_ref).to_map_tuple()?;
+        let key_index = Self::get_key_index(&prop_list, key, &player.allocator, is_sorted)?;
+        if is_required && key_index < 0 {
+            return Err(ScriptError::new(format!(
+                "Prop not found: {}",
+                Self::format_key_for_error(key)
+            )));
+        }
+        let index_to_add =
+            PropListUtils::find_index_to_add(&prop_list, (key_ref, value_ref), &player.allocator)?;
+        let (prop_list, ..) = player.get_datum_mut(prop_list_ref).to_map_tuple_mut()?;
+        if key_index >= 0 {
+            prop_list[key_index as usize].1 = value_ref.clone();
+        } else if is_sorted {
+            prop_list.insert(index_to_add as usize, (key_ref.clone(), value_ref.clone()));
+        } else {
+            prop_list.push_back((key_ref.clone(), value_ref.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn get_at(
+        prop_list: &VecDeque<PropListPair>,
+        key_ref: &DatumRef,
+        allocator: &DatumAllocator,
+        is_sorted: bool,
+    ) -> Result<DatumRef, ScriptError> {
+        let key = allocator.get_datum(key_ref);
+        match key {
+            // TODO do same for float
+            Datum::Int(index) => {
+                let index = (*index as usize) - 1;
+                if index < prop_list.len() {
+                    Ok(prop_list[index].1.clone())
+                } else {
+                    Err(ScriptError::new(format!("Index out of range: {}", index)))
+                }
+            }
+            _ => Self::get_by_key(prop_list, key_ref, &allocator, is_sorted),
+        }
+    }
+
+    pub fn get_by_key(
+        prop_list: &VecDeque<PropListPair>,
+        key_ref: &DatumRef,
+        allocator: &DatumAllocator,
+        is_sorted: bool,
+    ) -> Result<DatumRef, ScriptError> {
+        let key = allocator.get_datum(key_ref);
+        Self::get_by_concrete_key(prop_list, key, allocator, is_sorted)
+    }
+
+    /// `is_sorted` must be the owning `Datum::PropList`'s flag. An earlier cut
+    /// of this hard-coded `false` here on the assumption that every caller was
+    /// a small option list; `getPropRef` and `getAt` also come through here on
+    /// large sorted lists, and dropping their binary search measurably
+    /// regressed `get_key_index`. Pass the real flag.
+    pub fn get_by_concrete_key(
+        prop_list: &VecDeque<PropListPair>,
+        key: &Datum,
+        allocator: &DatumAllocator,
+        is_sorted: bool,
+    ) -> Result<DatumRef, ScriptError> {
+        let key_index = Self::get_key_index(prop_list, key, &allocator, is_sorted)?;
+        if key_index < 0 {
+            return Ok(DatumRef::Void);
+        }
+        Ok(prop_list[key_index as usize].1.clone())
+    }
+
+    pub fn set_at(
+        player: &mut DirPlayer,
+        prop_list_ref: &DatumRef,
+        key_ref: &DatumRef,
+        value_ref: &DatumRef,
+    ) -> Result<(), ScriptError> {
+        let key = &player.get_datum(key_ref);
+        match key {
+            // TODO do same for float
+            Datum::Int(index) => {
+                let index = (*index as usize) - 1;
+                let prop_list = player.get_datum_mut(prop_list_ref).to_map_mut()?;
+                if index < prop_list.len() {
+                    prop_list[index].1 = value_ref.clone();
+                } else if index <= prop_list.len() {
+                    prop_list.push_back((key_ref.clone(), value_ref.clone()));
+                } else {
+                    return Err(ScriptError::new(format!("Index out of range: {}", index)));
+                }
+            }
+            _ => Self::set_prop(prop_list_ref, key_ref, value_ref, player, false)?,
+        }
+        Ok(())
+    }
+}
+
+impl PropListDatumHandlers {
+    pub fn call(
+        datum: &DatumRef,
+        handler_name: Symbol,
+        args: &Vec<DatumRef>,
+    ) -> Result<DatumRef, ScriptError> {
+        match handler_name.into_builtin() {
+            Some(BuiltInSymbol::GetAt) => Self::get_at(datum, args),
+            Some(BuiltInSymbol::SetAt) => Self::set_at(datum, args),
+            Some(BuiltInSymbol::Sort) => Self::sort(datum, args),
+            Some(BuiltInSymbol::GetPropAt) => Self::get_prop_at(datum, args),
+            Some(BuiltInSymbol::AddProp) => Self::add_prop(datum, args),
+            Some(BuiltInSymbol::SetaProp) => Self::set_opt_prop(datum, args),
+            Some(BuiltInSymbol::SetProp) => {
+                if args.len() == 3 {
+                    reserve_player_mut(|player| {
+                        let prop_key_ref = &args[0];
+                        let index_ref = &args[1];
+                        let value_ref = &args[2];
+
+                        let (prop_list, is_sorted) =
+                            player.get_datum(datum).to_map_tuple()?;
+                        let list_ref =
+                            PropListUtils::get_by_key(prop_list, prop_key_ref, &player.allocator, is_sorted)?;
+
+                        let index = player.get_datum(index_ref).int_value()? as usize;
+                        let adjusted_index = if index == 0 { 0 } else { index - 1 };
+
+                        let list_datum = player.get_datum(&list_ref);
+                        match list_datum {
+                            Datum::List(_, list, _) => {
+                                // Calculate how many VOID values we need
+                                let current_len = list.len();
+                                let voids_needed = if adjusted_index >= current_len {
+                                    adjusted_index - current_len + 1
+                                } else {
+                                    0
+                                };
+                                
+                                // Allocate all VOID values first
+                                let void_refs: Vec<DatumRef> = (0..voids_needed)
+                                    .map(|_| player.alloc_datum(Datum::Void))
+                                    .collect();
+                                
+                                // Now get mutable reference and extend the list
+                                let (_, list_vec, _) =
+                                    player.get_datum_mut(&list_ref).to_list_mut()?;
+                                list_vec.extend(void_refs);
+                                
+                                // Set the value
+                                list_vec[adjusted_index] = value_ref.clone();
+                                Ok(DatumRef::Void)
+                            }
+                            Datum::PropList(..) => {
+                                // Property is a PropList. An INTEGER subscript is
+                                // POSITIONAL in Director (`setAt`), exactly as it
+                                // is for the plain-List arm above — only a
+                                // non-integer subscript is a property key. Going
+                                // straight to set_prop treated the index as a key
+                                // and APPENDED a new integer-keyed pair instead of
+                                // updating the slot:
+                                //   g.missionCompleted[g.levelID - 1] = 1
+                                //     → [.. #CHAR_WILDMUTT: 0, 3: 1, 1: 1]  (count 12)
+                                // which then double-counted on read, because
+                                // PropListUtils::get_prop tries the key first and
+                                // falls back to positional — so each completed
+                                // mission scored once via its bogus key and once
+                                // via its position (2 missions → a HUD "4 / 10").
+                                // set_at does the Int/positional split and still
+                                // routes non-integer keys to set_prop.
+                                PropListUtils::set_at(player, &list_ref, index_ref, value_ref)?;
+                                Ok(DatumRef::Void)
+                            }
+                            Datum::Point(..) => {
+                                // Point: index 1 = locH (x), index 2 = locV (y)
+                                if adjusted_index < 2 {
+                                    let new_val = player.get_datum(value_ref).clone();
+                                    let (component_val, is_float) = Datum::datum_to_inline_component(&new_val)?;
+                                    let (vals, flags) = player.get_datum_mut(&list_ref).to_point_inline_mut()?;
+                                    vals[adjusted_index] = component_val;
+                                    Datum::inline_set_float(flags, adjusted_index, is_float);
+                                    Ok(DatumRef::Void)
+                                } else {
+                                    Err(ScriptError::new(format!(
+                                        "Point index out of bounds: {} (must be 1 or 2)",
+                                        index
+                                    )))
+                                }
+                            }
+                            Datum::Rect(..) => {
+                                // Rect: index 1-4
+                                if adjusted_index < 4 {
+                                    let new_val = player.get_datum(value_ref).clone();
+                                    let (component_val, is_float) = Datum::datum_to_inline_component(&new_val)?;
+                                    let (vals, flags) = player.get_datum_mut(&list_ref).to_rect_inline_mut()?;
+                                    vals[adjusted_index] = component_val;
+                                    Datum::inline_set_float(flags, adjusted_index, is_float);
+                                    Ok(DatumRef::Void)
+                                } else {
+                                    Err(ScriptError::new(format!(
+                                        "Rect index out of bounds: {} (must be 1-4)",
+                                        index
+                                    )))
+                                }
+                            }
+                            _ => {
+                                Err(ScriptError::new(format!(
+                                    "Property is not a list or propList, it's: {}",
+                                    list_datum.type_str()
+                                )))
+                            }
+                        }
+                    })
+                } else if args.len() == 2 {
+                    Self::set_required_prop(datum, args)
+                } else {
+                    Err(ScriptError::new(format!(
+                        "Invalid number of arguments for setProp: {}",
+                        args.len()
+                    )))
+                }
+            }
+            Some(BuiltInSymbol::GetProp) => Self::get_prop(datum, args),
+            Some(BuiltInSymbol::GetaProp) => Self::get_a_prop(datum, args),
+            Some(BuiltInSymbol::DeleteProp) => Self::delete_prop(datum, args),
+            Some(BuiltInSymbol::DeleteAt) => Self::delete_at(datum, args),
+            Some(BuiltInSymbol::DeleteOne) => Self::delete_one(datum, args),
+            Some(BuiltInSymbol::GetOne) => Self::get_one(datum, args),
+            Some(BuiltInSymbol::FindPos) => Self::find_pos(datum, args),
+            Some(BuiltInSymbol::FindPosNear) => Self::find_pos_near(datum, args),
+            Some(BuiltInSymbol::GetPos) => Self::get_pos(datum, args),
+            Some(BuiltInSymbol::Duplicate) => Self::duplicate(datum, args),
+            Some(BuiltInSymbol::GetLast) => Self::get_last(datum, args),
+            Some(BuiltInSymbol::Count) => Self::count(datum, args),
+            Some(BuiltInSymbol::GetPropRef) => Self::get_prop_ref(datum, args),
+            Some(BuiltInSymbol::ToString) => {
+                // Support toString() on PropLists that have a #toString property (e.g. Flash Date objects)
+                reserve_player_mut(|player| {
+                    let prop_list = player.get_datum(datum).to_map()?;
+                    for (key_ref, val_ref) in prop_list {
+                        let key = player.get_datum(&key_ref);
+                        if let Datum::Symbol(s) = key {
+                            if *s == Symbol::builtin(BuiltInSymbol::ToString) {
+                                return Ok(val_ref.clone());
+                            }
+                        }
+                    }
+                    // Fallback: return string representation
+                    let formatted = crate::player::datum_formatting::format_datum(datum, &player);
+                    Ok(player.alloc_datum(Datum::String(formatted)))
+                })
+            }
+            _ => {
+                // Flash object prop lists from callbacks: handle getter/setter methods
+                // by mapping to properties. e.g. getScreenName() -> #screenName,
+                // getTypeOf() -> #typeOf, setScreenName(v) -> #screenName = v
+                let name_str = handler_name.as_str();
+                if name_str.starts_with("get") && name_str.len() > 3 {
+                    let prop_name = &name_str[3..];
+                    let prop_name_camel = {
+                        let mut chars = prop_name.chars();
+                        match chars.next() {
+                            Some(c) => format!("{}{}", c.to_lowercase(), chars.as_str()),
+                            None => String::new(),
+                        }
+                    };
+                    return reserve_player_mut(|player| {
+                        let prop_list = player.get_datum(datum).to_map()?.clone();
+                        for (key_ref, val_ref) in &prop_list {
+                            if let Datum::Symbol(s) = player.get_datum(key_ref) {
+                                if *s == Symbol::builtin(BuiltInSymbol::ToString) {
+                                    return Ok(val_ref.clone());
+                                }
+                            }
+                        }
+                        Ok(player.alloc_datum(Datum::Void))
+                    });
+                }
+                if name_str.starts_with("set") && name_str.len() > 3 {
+                    // Silently ignore setters on prop lists
+                    return Ok(DatumRef::Void);
+                }
+                Err(ScriptError::new(format!(
+                    "No handler {handler_name} for prop list datum"
+                )))
+            }
+        }
+    }
+
+    fn count(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (prop_list, is_sorted) = player.get_datum(datum).to_map_tuple()?;
+            let count = if args.is_empty() {
+                prop_list.len()
+            } else if args.len() == 1 {
+                let prop_name = &args[0];
+                let prop_value =
+                    PropListUtils::get_by_key(prop_list, prop_name, &player.allocator, is_sorted)?;
+                let prop_value = player.get_datum(&prop_value);
+                match prop_value {
+                    Datum::List(_, list, _) => list.len(),
+                    Datum::PropList(list, ..) => list.len(),
+                    _ => return Err(ScriptError::new("Cannot get count of non-list".to_string())),
+                }
+            } else {
+                return Err(ScriptError::new(
+                    "Invalid number of arguments for count".to_string(),
+                ));
+            };
+            Ok(player.alloc_datum(Datum::Int(count as i32)))
+        })
+    }
+
+    pub fn get_one(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let find = player.get_datum(&args[0]);
+            let prop_list = player.get_datum(datum);
+            let prop_list = match prop_list {
+                Datum::PropList(list, ..) => list,
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot set prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            // For prop lists, getOne returns the PROPERTY (key) for a given value.
+            let found_key = prop_list
+                .iter()
+                .find(|(_, v)| {
+                    datum_equals(player.get_datum(&v), find, &player.allocator).unwrap_or(false)
+                })
+                .map(|(k, _)| k.clone());
+
+            match found_key {
+                Some(key_ref) => Ok(key_ref),
+                None => Ok(player.alloc_datum(Datum::Int(0))),
+            }
+        })
+    }
+
+    pub fn find_pos(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let find = player.get_datum(&args[0]);
+            let prop_list = player.get_datum(datum);
+            let prop_list = match prop_list {
+                Datum::PropList(list, ..) => list,
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot set prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            let position = prop_list
+                .iter()
+                .position(|(k, _)| {
+                    // Use the lookup-aware equality so a STRING argument matches a
+                    // SYMBOL key (and vice-versa), matching Director: e.g.
+                    // `[#dozer: "none"].findPos("dozer")` -> 6, and the doc's
+                    // `foodList.findPos("breakfast")` -> 1 for key #breakfast.
+                    // Plain datum_equals is type-strict (#dozer != "dozer") and
+                    // returned VOID, breaking gSoundControl.adjustVolume.
+                    PropListUtils::datum_equals_for_lookup(player.get_datum(&k), find, &player.allocator)
+                        .unwrap()
+                })
+                .map(|x| x as i32);
+            if let Some(position) = position {
+                return Ok(player.alloc_datum(Datum::Int(position as i32 + 1)));
+            } else {
+                return Ok(DatumRef::Void);
+            }
+        })
+    }
+
+    /// `sortedPropList.findPosNear(property)` — Director 11.5 Scripting
+    /// Dictionary, `findPosNear`. For a *sorted* property list, returns the
+    /// 1-based position of the entry whose property (key) is the nearest
+    /// match to `property`. Unlike `findPos` (which is VOID when the property
+    /// is absent), `findPosNear` always reports the position of the closest
+    /// key. The doc's "most similar alphanumeric name" maps to the list's
+    /// sort order: we locate the key's sorted insertion point (lower bound)
+    /// and clamp it into `[1, count]` so the result is always a valid
+    /// position. On Run's DriveHuman behavior calls this on `sndGearSpeed`
+    /// (integer speed keys -> gear symbols) to pick the gear sound nearest the
+    /// current speed.
+    pub fn find_pos_near(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (prop_list, is_sorted) = player.get_datum(datum).to_map_tuple()?;
+            let count = prop_list.len() as i32;
+            if count == 0 {
+                return Ok(player.alloc_datum(Datum::Int(0)));
+            }
+            let result = if is_sorted {
+                let pos = PropListUtils::find_index_to_add(
+                    prop_list,
+                    (&args[0], &args[0]),
+                    &player.allocator,
+                )?;
+                (pos + 1).clamp(1, count)
+            } else {
+                // Unsorted list: fall back to an exact key match (mirrors the
+                // linear-list `findPosNear` path), returning 0 when absent.
+                let find = player.get_datum(&args[0]);
+                prop_list
+                    .iter()
+                    .position(|(k, _)| {
+                        // Lookup-aware equality so a string arg matches a symbol
+                        // key (parity with find_pos above).
+                        PropListUtils::datum_equals_for_lookup(player.get_datum(k), find, &player.allocator)
+                            .unwrap()
+                    })
+                    .map(|x| x as i32 + 1)
+                    .unwrap_or(0)
+            };
+            Ok(player.alloc_datum(Datum::Int(result)))
+        })
+    }
+
+    // Finds position of value
+    pub fn get_pos(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let find = player.get_datum(&args[0]);
+            let prop_list = player.get_datum(datum).to_map()?;
+            let position = prop_list
+                .iter()
+                .position(|(_, v)| {
+                    datum_equals(player.get_datum(&v), find, &player.allocator).unwrap()
+                })
+                .map(|x| x as i32)
+                .unwrap_or(-1);
+            return Ok(player.alloc_datum(Datum::Int(position + 1)));
+        })
+    }
+
+    pub fn get_last(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_list = player.get_datum(datum);
+            let prop_list = match prop_list {
+                Datum::PropList(list, ..) => list,
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot set prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            let last = prop_list.back().map(|(_, v)| v).unwrap();
+            Ok(last.clone())
+        })
+    }
+
+    pub fn duplicate(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        Ok(player_duplicate_datum(datum))
+    }
+
+    pub fn get_a_prop(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let key = player.get_datum(&args[0]);
+            let prop_list = player.get_datum(datum);
+
+            debug!(
+                "PropList getaProp: looking for key={} in proplist={}", 
+                format_concrete_datum(key, player),
+                format_concrete_datum(prop_list, player)
+            );
+
+            match prop_list {
+                Datum::PropList(entries, is_sorted) => {
+                    debug!(
+                        "PropList has {} entries", 
+                        entries.len()
+                    );
+                    
+                    for (i, (k, v)) in entries.iter().enumerate() {
+                        debug!(
+                            "   [{}] key={}, value={}", 
+                            i,
+                            format_concrete_datum(player.get_datum(k), player),
+                            format_concrete_datum(player.get_datum(v), player)
+                        );
+                    }
+                    
+                    let key_index =
+                        PropListUtils::get_key_index(entries, key, &player.allocator, *is_sorted)?;
+                    if key_index >= 0 {
+                        let result = entries[key_index as usize].1.clone();
+                        debug!(
+                            "Found at index {}: {}", 
+                            key_index,
+                            format_concrete_datum(player.get_datum(&result), player)
+                        );
+                        Ok(result)
+                    } else {
+                        debug!("get_a_prop: Key not found, returning void");
+                        Ok(DatumRef::Void)
+                    }
+                }
+                _ => Err(ScriptError::new(
+                    "Cannot get a prop of non-prop list".to_string(),
+                )),
+            }
+        })
+    }
+
+    pub fn get_prop(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        let base_prop_ref = reserve_player_mut(|player| {
+            let key = player.get_datum(&args[0]);
+            // Director returns VOID when looking up VOID key in a prop list
+            if matches!(key, Datum::Void) {
+                return Ok(DatumRef::Void);
+            }
+            let (prop_list, is_sorted) = player.get_datum(datum).to_map_tuple()?;
+            let key_index =
+                PropListUtils::get_key_index(prop_list, key, &player.allocator, is_sorted)?;
+            if key_index >= 0 {
+                Ok(prop_list[key_index as usize].1.clone())
+            } else {
+                let formatted_key = format_concrete_datum(key, player);
+                return Err(ScriptError::new(format!(
+                    "Unknown prop {} in prop list",
+                    formatted_key
+                )));
+            }
+        })?;
+
+        if args.len() == 1 {
+            return Ok(base_prop_ref);
+        } else if args.len() == 2 {
+            return reserve_player_mut(|player| {
+                TypeUtils::get_sub_prop(&base_prop_ref, &args[1], player)
+            });
+        } else {
+            return Err(ScriptError::new(
+                "Invalid number of arguments for getProp".to_string(),
+            ));
+        }
+    }
+
+    pub fn set_opt_prop(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_list = player.get_datum(datum);
+            match prop_list {
+                Datum::PropList(..) => {}
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot set prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            let prop_name_ref = &args[0];
+            let value_ref = &args[1];
+
+            PropListUtils::set_prop(datum, &prop_name_ref, &value_ref, player, false)?;
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn add_prop(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_name_ref = &args[0];
+            let value_ref = &args[1];
+
+            let (prop_list, is_sorted) = player.get_datum(datum).to_map_tuple()?;
+            let index_to_add = if is_sorted {
+                PropListUtils::find_index_to_add(
+                    &prop_list,
+                    (&prop_name_ref, &value_ref),
+                    &player.allocator,
+                )?
+            } else {
+                prop_list.len() as i32
+            };
+
+            let (prop_list, ..) = player.get_datum_mut(datum).to_map_tuple_mut()?;
+            if is_sorted {
+                prop_list.insert(
+                    index_to_add as usize,
+                    (prop_name_ref.clone(), value_ref.clone()),
+                );
+            } else {
+                prop_list.push_back((prop_name_ref.clone(), value_ref.clone()));
+            }
+
+            Ok(DatumRef::Void)
+        })
+    }
+
+    fn set_required_prop(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_list = player.get_datum(datum);
+            match prop_list {
+                Datum::PropList(..) => {}
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot set prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            let prop_name_ref = &args[0];
+            let value_ref = &args[1];
+
+            PropListUtils::set_prop(datum, &prop_name_ref, &value_ref, player, true)?;
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn set_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_list = player.get_datum(datum);
+            match prop_list {
+                Datum::PropList(..) => {}
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot set prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            let prop_name_ref = &args[0];
+            let value_ref = &args[1];
+
+            PropListUtils::set_at(player, datum, &prop_name_ref, &value_ref)?;
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn get_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_list = player.get_datum(datum);
+            let (prop_list, is_sorted) = match prop_list {
+                Datum::PropList(prop_list, is_sorted) => (prop_list, *is_sorted),
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot get prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            let prop_name_ref = &args[0];
+            PropListUtils::get_at(&prop_list, &prop_name_ref, &player.allocator, is_sorted)
+        })
+    }
+
+    pub fn delete_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let position = player.get_datum(&args[0]).int_value()?;
+            let prop_list = player.get_datum_mut(datum);
+            match prop_list {
+                Datum::PropList(prop_list, ..) => {
+                    prop_list.remove((position - 1) as usize);
+                    Ok(())
+                }
+                _ => Err(ScriptError::new(
+                    "Cannot get prop list at non-prop list".to_string(),
+                )),
+            }?;
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn delete_one(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        let index = reserve_player_ref(|player| {
+            let search_ref = &args[0];
+            let search_val = player.get_datum(search_ref);
+            let prop_list = player.get_datum(datum);
+            let prop_list = match prop_list {
+                Datum::PropList(list, ..) => list,
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot deleteOne on non-prop list".to_string(),
+                    ))
+                }
+            };
+            let index = prop_list.iter().position(|(_, v)| {
+                if v == search_ref {
+                    return true;
+                }
+                datum_equals(player.get_datum(v), search_val, &player.allocator).unwrap_or(false)
+            });
+            Ok(index)
+        })?;
+
+        reserve_player_mut(|player| {
+            if let Some(i) = index {
+                let prop_list = player.get_datum_mut(datum);
+                match prop_list {
+                    Datum::PropList(list, ..) => {
+                        list.remove(i);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn get_prop_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_list = player.get_datum(datum);
+            let prop_list = match prop_list {
+                Datum::PropList(prop_list, ..) => prop_list,
+                _ => {
+                    return Err(ScriptError::new(
+                        "Cannot get prop list at non-prop list".to_string(),
+                    ))
+                }
+            };
+            let position = player.get_datum(&args[0]).int_value()?;
+            Ok(prop_list.get((position - 1) as usize).unwrap().0.clone())
+        })
+    }
+
+    pub fn sort(datum: &DatumRef, _: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        let sorted_prop_list = reserve_player_ref(|player| {
+            let mut sorted_prop_list = player.get_datum(datum).to_map()?.clone();
+            sorted_prop_list.make_contiguous().sort_by(|a, b| {
+                let (left_key_ref, _) = a;
+                let (right_key_ref, _) = b;
+
+                let left = player.get_datum(left_key_ref);
+                let right = player.get_datum(right_key_ref);
+
+                if datum_equals(left, right, &player.allocator).unwrap() {
+                    return std::cmp::Ordering::Equal;
+                } else if datum_less_than(left, right, &player.allocator).unwrap() {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+            Ok(sorted_prop_list)
+        })?;
+
+        reserve_player_mut(|player| {
+            let (list_vec, is_sorted) = player.get_datum_mut(datum).to_map_tuple_mut()?;
+            list_vec.clear();
+            list_vec.extend(sorted_prop_list);
+            *is_sorted = true;
+
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn delete_prop(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let prop_name = player.get_datum(&args[0]);
+            
+            if prop_name.is_void() {
+                return Ok(player.alloc_datum(datum_bool(false)));
+            }
+            
+            if prop_name.is_string() || prop_name.is_symbol() {
+                // Key-based lookup for strings and symbols
+                let (prop_list, is_sorted) = player.get_datum(datum).to_map_tuple()?;
+                let index =
+                    PropListUtils::get_key_index(prop_list, prop_name, &player.allocator, is_sorted)?;
+                if index >= 0 {
+                    let prop_list = player.get_datum_mut(datum).to_map_mut()?;
+                    prop_list.remove(index as usize);
+                    Ok(player.alloc_datum(datum_bool(true)))
+                } else {
+                    Ok(player.alloc_datum(datum_bool(false)))
+                }
+            } else if prop_name.is_int() {
+                // For ints: try key lookup first, then fall back to positional
+                let (prop_list, is_sorted) = player.get_datum(datum).to_map_tuple()?;
+                let key_index =
+                    PropListUtils::get_key_index(prop_list, prop_name, &player.allocator, is_sorted)?;
+                
+                if key_index >= 0 {
+                    // Found as key - delete by key
+                    let prop_list = player.get_datum_mut(datum).to_map_mut()?;
+                    prop_list.remove(key_index as usize);
+                    Ok(player.alloc_datum(datum_bool(true)))
+                } else {
+                    // Not found as key - try positional (1-based)
+                    let position = prop_name.int_value()?;
+                    let prop_list = player.get_datum_mut(datum).to_map_mut()?;
+                    
+                    if position >= 1 && position <= prop_list.len() as i32 {
+                        prop_list.remove((position - 1) as usize);
+                        Ok(player.alloc_datum(datum_bool(true)))
+                    } else {
+                        Ok(player.alloc_datum(datum_bool(false)))
+                    }
+                }
+            } else {
+                // Other types (list/point, etc.) — key-based lookup
+                let (prop_list, is_sorted) = player.get_datum(datum).to_map_tuple()?;
+                let index =
+                    PropListUtils::get_key_index(prop_list, prop_name, &player.allocator, is_sorted)?;
+
+                if index >= 0 {
+                    let prop_list = player.get_datum_mut(datum).to_map_mut()?;
+                    prop_list.remove(index as usize);
+                    Ok(player.alloc_datum(datum_bool(true)))
+                } else {
+                    Ok(player.alloc_datum(datum_bool(false)))
+                }
+            }
+        })
+    }
+
+    pub fn get_prop_ref(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        if args.is_empty() {
+            return Err(ScriptError::new(
+                "getPropRef requires at least one argument".to_string(),
+            ));
+        }
+
+        let key = args[0].clone();
+        let player = unsafe { crate::player::player_mut() };
+        let base = player.get_datum(datum);
+
+        let result = match base {
+            Datum::PropList(prop_list, _is_sorted) => {
+                // Get the property from the prop list
+                let prop_value =
+                    PropListUtils::get_by_key(&prop_list, &key, &player.allocator, *_is_sorted)?;
+
+                // If there's a second argument and the property is a list, index into it
+                if args.len() >= 2 {
+                    let index_ref = &args[1];
+                    let prop_datum = player.get_datum(&prop_value);
+
+                    match prop_datum {
+                        Datum::List(_, items, _) => {
+                            let index = player.get_datum(index_ref).int_value()?;
+                            // Support both 0-based and 1-based indexing
+                            let actual_index = if index == 0 {
+                                0
+                            } else if index >= 1 {
+                                (index - 1) as usize
+                            } else {
+                                return Err(ScriptError::new(format!(
+                                    "Index out of bounds: {}",
+                                    index
+                                )));
+                            };
+
+                            if actual_index >= items.len() {
+                                return Err(ScriptError::new(format!(
+                                    "Index out of bounds: {}",
+                                    index
+                                )));
+                            }
+
+                            items[actual_index].clone()
+                        }
+                        // Nested PropList: an INTEGER subscript is POSITIONAL,
+                        // like the plain-List arm above and like the matching
+                        // write path (`setProp` → `PropListUtils::set_at`).
+                        // Only a non-integer subscript is a property key, which
+                        // is what `get_at` splits on.
+                        //
+                        // Reading it as a key made `p.list[i]` VOID for every
+                        // integer i, since the keys are symbols. Merlin's
+                        // Revenge expands its animation frame ranges with
+                        //   repeat while an <= numanims
+                        //     nextan = p.anims[an].sequence
+                        //     if ilk(nextan, #list) and nextan.count = 3 then
+                        //       ListInterpret(nextan)     -- [2, #til, 9] -> [2..9]
+                        // so `nextan` was VOID, `ilk` failed, and no sequence was
+                        // ever expanded. The player then animated frame 2, then
+                        // `#til` — `member(#til, N)` is not a member, so the
+                        // sprite blanked for a frame every walk cycle: the
+                        // blinking wizard.
+                        Datum::PropList(inner_pairs, inner_sorted) => {
+                            PropListUtils::get_at(
+                                &inner_pairs,
+                                index_ref,
+                                &player.allocator,
+                                *inner_sorted,
+                            )?
+                        }
+                        // Point: index 1 = locH (x), index 2 = locV (y)
+                        Datum::Point(vals, flags) => {
+                            let index = player.get_datum(index_ref).int_value()?;
+                            let actual_index = if index >= 1 { (index - 1) as usize } else { 0 };
+                            if actual_index < 2 {
+                                player.alloc_datum(Datum::inline_component_to_datum(vals[actual_index], Datum::inline_is_float(*flags, actual_index)))
+                            } else {
+                                return Err(ScriptError::new(format!(
+                                    "Point index out of bounds: {}", index
+                                )));
+                            }
+                        }
+                        // Rect: index 1-4
+                        Datum::Rect(vals, flags) => {
+                            let index = player.get_datum(index_ref).int_value()?;
+                            let actual_index = if index >= 1 { (index - 1) as usize } else { 0 };
+                            if actual_index < 4 {
+                                player.alloc_datum(Datum::inline_component_to_datum(vals[actual_index], Datum::inline_is_float(*flags, actual_index)))
+                            } else {
+                                return Err(ScriptError::new(format!(
+                                    "Rect index out of bounds: {}", index
+                                )));
+                            }
+                        }
+                        // Sprite: `p.spr[#foo]` is the bracket form of
+                        // `sprite(N).foo`, and Director resolves an unknown
+                        // sprite property against the properties of the
+                        // sprite's behaviours. Merlin's Revenge's shared
+                        // movement code does `p.spr[p.spr.pIam].w.runspeed`,
+                        // where every character behaviour sets `pIam` to a
+                        // symbol naming its own state property.
+                        Datum::SpriteRef(sprite_number) => {
+                            let sprite_number = *sprite_number;
+                            let prop_name = match player.get_datum(index_ref) {
+                                Datum::Symbol(name) => *name,
+                                Datum::String(name) => Symbol::from_str(name),
+                                other => {
+                                    return Err(ScriptError::new(format!(
+                                        "Cannot index sprite {} with {}",
+                                        sprite_number,
+                                        other.type_str()
+                                    )))
+                                }
+                            };
+                            let result = crate::player::score::sprite_get_prop(
+                                player,
+                                sprite_number,
+                                prop_name,
+                            )?;
+                            // Keep the behaviour's own DatumRef when there is
+                            // one, so in-place mutation still lands on the
+                            // instance's storage rather than on a clone.
+                            player
+                                .last_sprite_prop_ref
+                                .take()
+                                .unwrap_or_else(|| player.alloc_datum(result))
+                        }
+                        _ => return Err(ScriptError::new(
+                            "Second argument to getPropRef requires first property to be a list or propList"
+                                .to_string(),
+                        )),
+                    }
+                } else {
+                    prop_value
+                }
+            }
+            _ => {
+                return Err(ScriptError::new(
+                    "getPropRef: datum is not a propList".to_string(),
+                ))
+            }
+        };
+
+        // If there are more keys, recursively resolve
+        if args.len() > 2 {
+            TypeUtils::get_sub_prop(&result, &args[2], player)
+        } else {
+            Ok(result)
+        }
+    }
+}

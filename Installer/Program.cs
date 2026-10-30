@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Reflection;
-using System.Security.Cryptography;
 using System.Windows.Forms;
 
 namespace ToonTwisterSetup;
@@ -155,31 +154,54 @@ internal sealed class SetupForm : Form
             return;
         }
 
-        var localAssets = Path.Combine(Workspace, "Assets");
-        var converted = Path.Combine(localAssets, "Converted-v3");
-        var audio = Path.Combine(localAssets, "Audio");
-        if (!HasMatchingLocalAssetSet(sourcePath, localAssets))
-        {
-            MessageBox.Show(this, nl
-                ? "De conversiecache in dit Codex-project hoort niet bij deze installatieversie. Selecteer de originele installatie waarvoor deze editor-assets zijn gemaakt."
-                : "The conversion cache in this Codex project does not match this installation version. Select the original installation used to create these editor assets.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
         var embedded = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.ToonTwisterNative.exe");
-        if (embedded is null || !Directory.Exists(converted) || !Directory.Exists(audio))
+        var w3dConverter = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.AssetConverter.w3d_export.exe");
+        var audioConverter = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.AssetConverter.audio_export.exe");
+        if (embedded is null || w3dConverter is null || audioConverter is null)
         {
-            MessageBox.Show(this, nl ? "De lokale editor- of conversiecache ontbreekt. Plaats de installer in de map Native Engine en herstel de projectmap Assets." : "The local editor or conversion cache is missing. Put the installer beside the Native Engine project and restore its Assets folder.", Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, nl ? "De installer is onvolledig: een editor- of conversieonderdeel ontbreekt." : "The installer is incomplete: an editor or conversion component is missing.", Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
 
         installing = true;
         install.Enabled = false;
+        string? staging = null;
         try
         {
+            staging = Path.Combine(Path.GetTempPath(), "ToonTwisterSetup-" + Guid.NewGuid().ToString("N"));
+            var converted = Path.Combine(staging, "Converted-v3");
+            var audio = Path.Combine(staging, "Audio");
+            var converterFolder = Path.Combine(staging, "Converter");
+            Directory.CreateDirectory(converterFolder);
+            var w3dPath = Path.Combine(converterFolder, "w3d_export.exe");
+            var audioPath = Path.Combine(converterFolder, "audio_export.exe");
+            using (var output = File.Create(w3dPath)) await w3dConverter.CopyToAsync(output);
+            using (var output = File.Create(audioPath)) await audioConverter.CopyToAsync(output);
+            w3dConverter.Dispose();
+            audioConverter.Dispose();
+
+            status.Text = nl ? "3D-modellen en animaties omzetten… Dit kan enkele minuten duren." : "Converting 3D models and animations… This can take several minutes.";
+            progress.Style = ProgressBarStyle.Marquee;
+            progress.MarqueeAnimationSpeed = 24;
+            var models = await RunConverterAsync(w3dPath, sourcePath, converted);
+            if (!models.Contains("converted=", StringComparison.OrdinalIgnoreCase) || !TryReadCount(models, "converted=", out var convertedCount) || convertedCount == 0)
+                throw new InvalidOperationException(nl ? "De installatie bevat geen omzetbare 3D-modellen. Controleer of je de volledige originele map hebt gekozen." : "No convertible 3D models were found. Check that you selected the complete original installation folder.");
+            if (!TryReadCount(models, "failed=", out var failedCount) || failedCount != 0)
+                throw new InvalidOperationException(nl ? $"Het omzetten van de originele installatie is gestopt: {failedCount} 3D-bestanden konden niet worden gelezen. Er is niets in de doelmap geïnstalleerd." : $"Conversion stopped: {failedCount} original 3D files could not be read. Nothing was installed in the destination folder.");
+            progress.Style = ProgressBarStyle.Blocks;
+            progress.Value = 50;
+
+            status.Text = nl ? "Audio omzetten…" : "Converting audio…";
+            progress.Style = ProgressBarStyle.Marquee;
+            var sounds = await RunConverterAsync(audioPath, sourcePath, audio);
+            if (!TryReadCount(sounds, "exported ", out var soundCount) || soundCount == 0)
+                throw new InvalidOperationException(nl ? "Er is geen audio uit de originele installatie gelezen. Controleer de bestanden Music.cxt en sfx.cxt." : "No audio was read from the original installation. Check Music.cxt and sfx.cxt.");
+
+            progress.Style = ProgressBarStyle.Blocks;
+            status.Text = nl ? $"Geconverteerde media installeren ({convertedCount} 3D-bestanden, {soundCount} geluiden)…" : $"Installing converted media ({convertedCount} 3D files, {soundCount} sounds)…";
             Directory.CreateDirectory(destination);
             var appAssets = Path.Combine(destination, "Assets");
             Directory.CreateDirectory(appAssets);
-            status.Text = nl ? "Originele modellen en achtergronden kopiëren…" : "Copying original models and backgrounds…";
             await Task.Run(() =>
             {
                 CopyTree(Path.Combine(sourcePath, "w3d"), Path.Combine(appAssets, "w3d"));
@@ -190,8 +212,6 @@ internal sealed class SetupForm : Form
                 foreach (var file in new[] { "intro.mov", "logo_nick.mov", "logo_schol.mov", "logo_wf.mov" }) CopyIfExists(Path.Combine(sourcePath, file), appAssets);
                 CopyTree(converted, Path.Combine(appAssets, "Converted-v3"));
                 CopyTree(audio, Path.Combine(appAssets, "Audio"));
-                foreach (var optional in new[] { "CatalogThumbnails", "DirectorData" })
-                    if (Directory.Exists(Path.Combine(localAssets, optional))) CopyTree(Path.Combine(localAssets, optional), Path.Combine(appAssets, optional));
                 CopyTree(Path.Combine(Workspace, "Encoder"), Path.Combine(destination, "Encoder"));
             });
             status.Text = nl ? "Native Studio installeren…" : "Installing Native Studio…";
@@ -212,7 +232,54 @@ internal sealed class SetupForm : Form
             status.Text = nl ? "Installatie mislukt." : "Installation failed.";
             MessageBox.Show(this, ex.Message, nl ? "Installatie mislukt" : "Installation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
-        finally { installing = false; install.Enabled = true; }
+        finally
+        {
+            embedded.Dispose();
+            if (staging is not null && Directory.Exists(staging))
+            {
+                try { await Task.Run(() => Directory.Delete(staging, recursive: true)); } catch { }
+            }
+            progress.Style = ProgressBarStyle.Blocks;
+            progress.MarqueeAnimationSpeed = 0;
+            installing = false;
+            install.Enabled = true;
+        }
+    }
+
+    private static async Task<string> RunConverterAsync(string executable, string input, string output)
+    {
+        Directory.CreateDirectory(output);
+        var start = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            WorkingDirectory = Path.GetDirectoryName(executable)!
+        };
+        start.ArgumentList.Add(input);
+        start.ArgumentList.Add(output);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("The asset converter could not be started.");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var result = await stdout;
+        var errors = await stderr;
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"Asset conversion failed (exit code {process.ExitCode}).\n{errors.Trim()}\n{result.Trim()}");
+        return result;
+    }
+
+    private static bool TryReadCount(string output, string prefix, out int count)
+    {
+        count = 0;
+        var line = output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .LastOrDefault(x => x.Contains(prefix, StringComparison.OrdinalIgnoreCase));
+        if (line is null) return false;
+        var token = line[(line.LastIndexOf(prefix, StringComparison.OrdinalIgnoreCase) + prefix.Length)..]
+            .Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault();
+        return token is not null && int.TryParse(token, out count);
     }
 
     private static bool TryValidateSource(string folder, out string reason)
@@ -243,32 +310,6 @@ internal sealed class SetupForm : Form
     {
         var root = Path.GetFullPath(b).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         return a.Equals(b, StringComparison.OrdinalIgnoreCase) || a.StartsWith(root, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool HasMatchingLocalAssetSet(string source, string assets)
-    {
-        // Cached conversions are only accepted when they match several local source files.
-        // This prevents installing OBJ/texture caches from a different game release.
-        string[] sentinels = ["act_spongebob_hi.w3d", "act_squidward_hi.w3d", "3dp_bed_hi.w3d"];
-        foreach (var name in sentinels)
-        {
-            var fromSource = Path.Combine(source, "w3d", name);
-            var fromProject = Path.Combine(assets, "w3d", name);
-            if (!File.Exists(fromSource) || !File.Exists(fromProject)) return false;
-            using var left = File.OpenRead(fromSource);
-            using var right = File.OpenRead(fromProject);
-            if (!SHA256.HashData(left).SequenceEqual(SHA256.HashData(right))) return false;
-        }
-        foreach (var name in new[] { "Music.cxt", "sfx.cxt" })
-        {
-            var fromSource = Path.Combine(source, name);
-            var fromProject = Path.Combine(assets, name);
-            if (!File.Exists(fromSource) || !File.Exists(fromProject)) return false;
-            using var left = File.OpenRead(fromSource);
-            using var right = File.OpenRead(fromProject);
-            if (!SHA256.HashData(left).SequenceEqual(SHA256.HashData(right))) return false;
-        }
-        return true;
     }
 
     private static void CopyIfExists(string file, string targetFolder)

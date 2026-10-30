@@ -1,0 +1,285 @@
+use binary_reader::{BinaryReader, Endian};
+
+use log::debug;
+
+use crate::director::{
+    chunks::cast_member_info::CastMemberInfoChunk,
+    enums::{BitmapInfo, FilmLoopInfo, FlashInfo, FontInfo, MemberType, ScriptType, ShapeInfo, SoundInfo, FieldInfo, TextInfo},
+};
+
+use super::Chunk;
+
+pub struct CastMemberChunk {
+    pub member_type: MemberType,
+    pub specific_data: CastMemberSpecificData,
+    pub specific_data_raw: Vec<u8>,
+    pub member_info: Option<CastMemberInfoChunk>,
+}
+
+pub struct CastMemberDef {
+    pub chunk: CastMemberChunk,
+    pub children: Vec<Option<Chunk>>,
+}
+
+impl CastMemberChunk {
+    // Helper to read u16 safely
+    fn read_u16_safe(reader: &mut BinaryReader) -> Option<u16> {
+        reader.read_u16().ok()
+    }
+
+    // Helper to read u32 safely
+    fn read_u32_safe(reader: &mut BinaryReader) -> Option<u32> {
+        reader.read_u32().ok()
+    }
+
+    #[allow(unused_variables, unused_assignments)]
+    pub fn from_reader(
+        reader: &mut BinaryReader,
+        dir_version: u16,
+    ) -> Result<CastMemberChunk, String> {
+        reader.endian = Endian::Big;
+
+        let mut data_test = Vec::new();
+
+        let r_begin = reader.pos;
+        while let Ok(byte) = reader.read_u8() {
+            data_test.push(byte);
+        }
+
+        let hex_dump = data_test
+            .iter()
+            .map(|b| format!("{:02X} ", b))
+            .collect::<Vec<String>>()
+            .join(" ");
+        debug!(
+            "CASt (Full Chunk, {} bytes):\n{}",
+            data_test.len(),
+            hex_dump
+        );
+
+        reader.pos = r_begin;
+
+        let mut info: Option<CastMemberInfoChunk> = None;
+        let info_len: usize;
+        let specific_data: Vec<u8>;
+        let specific_data_len: usize;
+        let member_type: MemberType;
+        let mut has_flags1 = false;
+        let flags1: u8;
+        let specific_data_parsed;
+
+        if dir_version >= 500 {
+            let raw_member_type = reader.read_u32().unwrap();
+            // Standard Director numbers a Linked Movie (`#movie`) as type 9, but
+            // this (reverse-engineered) MemberType enum uses 9 for Shape, so
+            // `from(9)` would mislabel a Linked Movie member (e.g. Neopets DGS
+            // `place_holder.dcr`) as Shape. Remap raw 9 to Movie explicitly.
+            // Raw 8 is left as-is (the downstream shape-info disambiguator turns
+            // real QuickDraw shapes at 8 into Shapes; real Flash Asset members
+            // are Ole = 15), and raw 2 stays FilmLoop — both verified correct.
+            member_type = match raw_member_type {
+                9 => MemberType::Movie,
+                other => MemberType::from(other),
+            };
+            info_len = reader.read_u32().unwrap() as usize;
+            specific_data_len = reader.read_u32().unwrap() as usize;
+
+            // info
+            if info_len != 0 {
+                let mut info_reader = BinaryReader::from_u8(reader.read_bytes(info_len).unwrap());
+                info_reader.set_endian(reader.endian);
+
+                info = Some(CastMemberInfoChunk::read(&mut info_reader, dir_version).unwrap());
+            }
+
+            // specific data
+            let has_flags1 = false;
+            specific_data = reader.read_bytes(specific_data_len).unwrap().to_vec();
+        } else {
+            specific_data_len = reader.read_u16().unwrap() as usize;
+            info_len = reader.read_u32().unwrap() as usize;
+
+            // these bytes are common but stored in the specific data
+            let mut specific_data_left = specific_data_len;
+            // Director 4 (and earlier) uses the CLASSIC cast-member type codes,
+            // which diverge from dirplayer's `MemberType` enum (modern numbering)
+            // starting at 8: D4 has 8=Shape, 9=Movie, whereas the enum has
+            // 8=Flash, 9=Shape. Flash / Shockwave3D members postdate D4, so a
+            // raw 8 here is a QuickDraw Shape (e.g. thead's pattern-filled
+            // background), not Flash. Codes 1-7 and 10+ already match. Remap the
+            // two divergent codes; everything else passes through unchanged.
+            let raw_type = reader.read_u8().unwrap() as u32;
+            member_type = match raw_type {
+                8 => MemberType::Shape,
+                // D4 "Movie" (linked/embedded movie) — dirplayer has no Movie
+                // member type; it shares the film-loop/video memory format.
+                9 => MemberType::FilmLoop,
+                other => MemberType::from(other),
+            };
+            specific_data_left -= 1;
+            if specific_data_left != 0 {
+                has_flags1 = true;
+                flags1 = reader.read_u8().unwrap();
+                specific_data_left -= 1;
+            } else {
+                has_flags1 = false;
+            }
+
+            // specific data
+            specific_data = reader.read_bytes(specific_data_left).unwrap().to_vec();
+
+            // info
+            let mut info_reader = BinaryReader::from_u8(reader.read_bytes(info_len).unwrap());
+            info_reader.set_endian(reader.endian);
+            if info_len != 0 {
+                info = Some(CastMemberInfoChunk::read(&mut info_reader, dir_version).unwrap());
+            }
+        }
+
+        let mut specific_reader = BinaryReader::from_vec(&specific_data);
+        specific_reader.set_endian(reader.endian);
+
+        match member_type {
+            MemberType::Script => {
+                specific_data_parsed = CastMemberSpecificData::Script(ScriptType::from(
+                    specific_reader.read_u16().unwrap(),
+                ));
+            }
+            MemberType::Bitmap => {
+                specific_data_parsed =
+                    CastMemberSpecificData::Bitmap(BitmapInfo::from_versioned(specific_data.as_slice(), dir_version));
+            }
+            MemberType::Shape => {
+                specific_data_parsed =
+                    CastMemberSpecificData::Shape(ShapeInfo::from(specific_data.as_slice()));
+            }
+            // a few cast member types may share the same memory format
+            // including film loop, movie, digital video, and xtra
+            // according to More Director Movie File Unofficial Documentation:
+            // https://docs.google.com/document/d/1jDBXE4Wv1AEga-o1Wi8xtlNZY4K2fHxW2Xs8RgARrqk/edit
+            MemberType::FilmLoop => {
+                // film loops share the same memory structure as other cast members such as video, digital movie
+                specific_data_parsed =
+                    CastMemberSpecificData::FilmLoop(FilmLoopInfo::from(specific_data.as_slice()))
+            }
+            MemberType::Flash => {
+                if let Some(flash_info) = FlashInfo::from(specific_data.as_slice()) {
+                    specific_data_parsed = CastMemberSpecificData::Flash(flash_info);
+                } else {
+                    specific_data_parsed = CastMemberSpecificData::None;
+                }
+            }
+            MemberType::Sound => {
+                specific_data_parsed = CastMemberSpecificData::None;
+            }
+            MemberType::Text => {
+                // Check if this is D6+ format with "text" FourCC header
+                if TextInfo::looks_like_text_info(specific_data.as_slice()) {
+                    specific_data_parsed =
+                        CastMemberSpecificData::Text(TextInfo::from(specific_data.as_slice()));
+                } else {
+                    // Fall back to older D4/D5 FieldInfo format
+                    specific_data_parsed =
+                        CastMemberSpecificData::Field(FieldInfo::from(specific_data.as_slice()));
+                }
+            }
+            _ => {
+                specific_data_parsed = CastMemberSpecificData::None;
+            }
+        }
+
+        return Ok(CastMemberChunk {
+            member_type,
+            specific_data: specific_data_parsed,
+            specific_data_raw: specific_data,
+            member_info: info,
+        });
+    }
+}
+
+pub enum CastMemberSpecificData {
+    Script(ScriptType),
+    Bitmap(BitmapInfo),
+    Shape(ShapeInfo),
+    FilmLoop(FilmLoopInfo),
+    Sound(SoundInfo),
+    Font(FontInfo),
+    Field(FieldInfo),
+    Text(TextInfo),  // D6+ text member with "text" FourCC header
+    Flash(FlashInfo),
+    None,
+}
+
+impl CastMemberSpecificData {
+    pub fn script_type(&self) -> Option<ScriptType> {
+        if let CastMemberSpecificData::Script(script_type) = self {
+            Some(*script_type)
+        } else {
+            None
+        }
+    }
+
+    pub fn bitmap_info(&self) -> Option<&BitmapInfo> {
+        if let CastMemberSpecificData::Bitmap(bitmap_info) = self {
+            Some(bitmap_info)
+        } else {
+            None
+        }
+    }
+
+    pub fn shape_info(&self) -> Option<&ShapeInfo> {
+        if let CastMemberSpecificData::Shape(shape_info) = self {
+            Some(shape_info)
+        } else {
+            None
+        }
+    }
+
+    pub fn film_loop_info(&self) -> Option<&FilmLoopInfo> {
+        if let CastMemberSpecificData::FilmLoop(film_loop_info) = self {
+            Some(film_loop_info)
+        } else {
+            None
+        }
+    }
+
+    pub fn flash_info(&self) -> Option<&FlashInfo> {
+        if let CastMemberSpecificData::Flash(info) = self {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub fn sound_info(&self) -> Option<&SoundInfo> {
+        if let CastMemberSpecificData::Sound(sound_info) = self {
+            Some(sound_info)
+        } else {
+            None
+        }
+    }
+
+    pub fn font_info(&self) -> Option<&FontInfo> {
+        if let CastMemberSpecificData::Font(info) = self {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub fn field_info(&self) -> Option<&FieldInfo> {
+        if let CastMemberSpecificData::Field(field_info) = self {
+            Some(field_info)
+        } else {
+            None
+        }
+    }
+
+    pub fn text_info(&self) -> Option<&TextInfo> {
+        if let CastMemberSpecificData::Text(text_info) = self {
+            Some(text_info)
+        } else {
+            None
+        }
+    }
+}

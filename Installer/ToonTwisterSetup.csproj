@@ -9,5 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="..\InstallerPayload\ToonTwisterNative.exe" LogicalName="Payload.ToonTwisterNative.exe" />
+    <EmbeddedResource Include="..\Tools\AssetConverter\w3d_export.exe" LogicalName="Payload.AssetConverter.w3d_export.exe" />
+    <EmbeddedResource Include="..\Tools\AssetConverter\audio_export.exe" LogicalName="Payload.AssetConverter.audio_export.exe" />
   </ItemGroup>
 </Project>

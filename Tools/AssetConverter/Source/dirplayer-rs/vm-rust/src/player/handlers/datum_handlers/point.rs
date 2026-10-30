@@ -1,0 +1,136 @@
+use crate::{
+    director::lingo::datum::{Datum, datum_bool},
+    player::{DatumRef, DirPlayer, ScriptError, reserve_player_mut, symbols::symbol::Symbol},
+};
+
+pub struct PointDatumHandlers {}
+
+impl PointDatumHandlers {
+    #[allow(dead_code, unused_variables)]
+    pub fn call(
+        datum: &DatumRef,
+        handler_name: Symbol,
+        args: &Vec<DatumRef>,
+    ) -> Result<DatumRef, ScriptError> {
+        match handler_name.as_lower_str() {
+            "getat" => Self::get_at(datum, args),
+            "setat" => Self::set_at(datum, args),
+            "inside" => Self::inside(datum, args),
+            "duplicate" => Self::duplicate(datum, args),
+            // A point is addressable like a two-element linear list —
+            // `point[1]` / `point[2]` read and write it, and `duplicate()`
+            // already works — so `count` answers 2. Generic list helpers get
+            // handed points all the time: Merlin's Revenge routes a sprite
+            // location through `ListInteger(alist)`, which does
+            // `alist.duplicate().count()` before rounding each element, and
+            // erroring here killed the handler that positions map tiles.
+            "count" => reserve_player_mut(|player| Ok(player.alloc_datum(Datum::Int(2)))),
+            _ => Err(ScriptError::new(format!(
+                "no handler {handler_name} for point"
+            ))),
+        }
+    }
+
+    pub fn duplicate(datum: &DatumRef, _args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (vals, flags) = player.get_datum(datum).to_point_inline()?;
+            Ok(player.alloc_datum(Datum::Point(vals, flags)))
+        })
+    }
+
+    pub fn inside(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (point, _pf) = player.get_datum(datum).to_point_inline()?;
+            let (rect, _rf) = player.get_datum(&args[0]).to_rect_inline()?;
+
+            let px = point[0] as i32;
+            let py = point[1] as i32;
+            let x1 = rect[0] as i32;
+            let y1 = rect[1] as i32;
+            let x2 = rect[2] as i32;
+            let y2 = rect[3] as i32;
+
+            let inside = x1 <= px && px < x2 && y1 <= py && py < y2;
+
+            Ok(player.alloc_datum(datum_bool(inside)))
+        })
+    }
+
+    pub fn get_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let (vals, flags) = player.get_datum(datum).to_point_inline()?;
+
+            let index = player.get_datum(&args[0]).int_value()?; // 1 or 2
+            if !(1..=2).contains(&index) {
+                return Err(ScriptError::new("Invalid index for point".to_string()));
+            }
+
+            let i = (index - 1) as usize;
+            let component = Datum::inline_component_to_datum(vals[i], Datum::inline_is_float(flags, i));
+            Ok(player.alloc_datum(component))
+        })
+    }
+
+    pub fn set_at(datum: &DatumRef, args: &Vec<DatumRef>) -> Result<DatumRef, ScriptError> {
+        reserve_player_mut(|player| {
+            let index = player.get_datum(&args[0]).int_value()?;
+
+            if !(1..=2).contains(&index) {
+                return Err(ScriptError::new("Invalid index for point".to_string()));
+            }
+
+            let new_val = player.get_datum(&args[1]).clone();
+            let (val, is_float) = Datum::datum_to_inline_component(&new_val)?;
+
+            let i = (index - 1) as usize;
+            let (vals, flags) = player.get_datum_mut(datum).to_point_inline_mut()?;
+            vals[i] = val;
+            Datum::inline_set_float(flags, i, is_float);
+
+            Ok(DatumRef::Void)
+        })
+    }
+
+    pub fn get_prop(
+        player: &DirPlayer,
+        datum: &DatumRef,
+        prop: Symbol,
+    ) -> Result<Datum, ScriptError> {
+        let (vals, flags) = player.get_datum(datum).to_point_inline()?;
+
+        match prop.as_lower_str() {
+            "loch" => Ok(Datum::inline_component_to_datum(vals[0], Datum::inline_is_float(flags, 0))),
+            "locv" => Ok(Datum::inline_component_to_datum(vals[1], Datum::inline_is_float(flags, 1))),
+            "ilk"  => Ok(Datum::Symbol(Symbol::from_str("point"))),
+            // `(expr).float` is the property form of `float(expr)` (Director 11.5
+            // Scripting Dictionary, "float()": Usage `(expression).float`).
+            // Director returns a point unchanged from float() — verified:
+            //   p = point(-342, 159); put float(p * p) -- point(116964, 25281)
+            // so both surfaces must agree. See TypeHandlers::float.
+            "float" => Ok(player.get_datum(datum).clone()),
+            _ => Err(ScriptError::new(format!("Cannot get point property {}", prop))),
+        }
+    }
+
+    pub fn set_prop(
+        player: &mut DirPlayer,
+        datum: &DatumRef,
+        prop: Symbol,
+        value_ref: &DatumRef,
+    ) -> Result<(), ScriptError> {
+        let new_val = player.get_datum(value_ref).clone();
+        let (val, is_float) = Datum::datum_to_inline_component(&new_val)?;
+
+        let idx = match prop.as_lower_str() {
+            "loch" => 0usize,
+            "locv" => 1usize,
+            _ => return Err(ScriptError::new(format!("Cannot set point property {}", prop))),
+        };
+
+        let (vals, flags) = player.get_datum_mut(datum).to_point_inline_mut()?;
+        vals[idx] = val;
+        Datum::inline_set_float(flags, idx, is_float);
+
+        Ok(())
+    }
+}

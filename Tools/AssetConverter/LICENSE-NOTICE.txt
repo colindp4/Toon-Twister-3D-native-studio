@@ -1,0 +1,1 @@
+The converter component under Tools/AssetConverter is licensed under GNU GPL v3 only. See Tools/AssetConverter/Source/dirplayer-rs/LICENSE for the full license and corresponding source. The rest of Toon Twister 3-D Native Studio is a separate project; the GPL terms apply to the converter component and modifications to it.
