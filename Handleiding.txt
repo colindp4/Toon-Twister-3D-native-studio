@@ -1,0 +1,46 @@
+TOON TWISTER 3-D — NATIVE EDITOR
+
+STARTEN
+Sla je scène op en sluit een eerder geopend venster voordat je de update start.
+Dubbelklik START TOON TWISTER.bat in de hoofdmap. Je kunt ook Native Editor\ToonTwisterNative.exe openen vanuit de map van de Native Engine. Laat Assets en de runtimebestanden naast de EXE staan.
+
+PREP
+Kies Sets, Actors of Props. Klik een kaartje voor een voorbeeld en daarna Aan scène toevoegen. Een nieuw decor vervangt het vorige. Decors zijn beschermd tegen per ongeluk verslepen.
+Sleep een geplaatst personage of voorwerp. Shift + slepen verandert de diepte. Rechts slepen draait de camera; het wiel zoomt. Camera reset herstelt de originele decorcamera. In beeld zetten kadreert het gekozen object.
+
+ACTIES EN GELUID OP DE TIJDLIJN
+Selecteer een acteur en ga naar Direct. Kies Act, Talk, Music of SFX.
+Sleep een actie of geluidsfragment naar de tijdlijn. De horizontale plaats bepaalt het begin. De acteur heeft een eigen groen actiespoor en een geel stemspoor. Muziek en effecten hebben eigen sporen.
+Dubbelklikken plaatst een fragment op de rode afspeelkop. Klikken op een actie toont direct een voorbeeld van de oorspronkelijke animatie.
+Walks, Moods en Actions zijn de originele actiecategorieën. Stel bij herhalende acties de gewenste duur in, of verleng het fragment later door de rechterrand te slepen.
+Een nieuwe actie overschrijft een bestaande actie niet. Bij invoegen wordt de eerstvolgende vrije ruimte gebruikt. Een verplaatsing die twee acties van dezelfde acteur laat overlappen wordt teruggedraaid.
+Talk toont de originele uitspraken van de geselecteerde acteur. De mond beweegt automatisch met de oorspronkelijke lipsync-data, zowel bij Beluisteren als bij afspelen van de film. Ook na verschuiven of bijsnijden blijft de mond aan het juiste stukje geluid gekoppeld.
+Lange muziek wordt automatisch ingekort tot de beschikbare scèneruimte; het originele bestand blijft volledig bewaard.
+
+BEWERKEN
+- Sleep midden op een gekleurd fragment om het te verplaatsen.
+- Sleep een rand om bij te snijden. Herhalende acties kun je ook langer maken.
+- Klik/sleep op de tijdliniaal om de afspeelkop te verplaatsen en de pose te bekijken.
+- Gebruik Zoom voor meer detail. De horizontale schuifbalk brengt andere tijden in beeld.
+- Vastklikken zet wijzigingen op stappen van 0,1 seconde. Houd Alt ingedrukt om tijdelijk nauwkeuriger te werken.
+- Ctrl+Z: ongedaan maken. Ctrl+Y: opnieuw. Delete: geselecteerd fragment verwijderen. Spatie: afspelen/pauze.
+- Rechtsklik op een fragment om het te verwijderen.
+
+VERPLAATSING VAN PERSONAGES
+Selecteer de acteur, zet de tijd en klik + Positie. Kies een later moment, verplaats of draai de acteur en klik weer + Positie. De blauwe ruitjes zijn verplaatsbare positiepunten. Ook verwijderen en Ctrl+Z werken daarop.
+Een acteur kan tegelijk bewegen, een originele skeletactie uitvoeren en praten.
+
+PANELEN EN APARTE VENSTERS
+Sleep de groene scheidingsbalken: links/rechts voor paneelbreedte, boven/onder de keuzebibliotheek voor paneelhoogte en tijdlijnhoogte.
+Via Indeling kun je Eigenschappen, Keuzemenu of Tijdlijn in een apart verplaatsbaar en schaalbaar venster zetten. Sluiten zet het paneel terug. Standaardindeling herstellen zet alles weer op zijn oorspronkelijke plek.
+Hoofdvensterformaat, paneelgroottes en tijdlijnzoom worden lokaal onthouden.
+
+SCENES EN OPSLAAN
+Maak met + Scène maximaal acht scènes. De pijlen wisselen tussen scènes.
+Afspelen in Direct toont de huidige scène. Edit > Bekijk film speelt de scènes achter elkaar.
+Opslaan bewaart modellen, plaatsingen, acties, geluid, lipsync, bijsnijdingen en positiepunten als .ttnative. Openen herstelt die film. De verwijzingen naar game-assets worden relatief bewaard.
+
+RECONSTRUCTIESTATUS
+De oorspronkelijke modellen, camera's, transparantiemaskers, skeletanimaties, acht mondstanden per personage en originele dialogen worden gebruikt. De mondstanden volgen de oorspronkelijke lipdata op 30 beelden per seconde.
+Deze editor bevat nog geen originele .tt3-import, scèneovergangen, eigen stemopname of video-export. Zeven ADPCM-helpstemfragmenten zijn nog niet gedecodeerd.
+

@@ -1,0 +1,23 @@
+# Original game files and locally generated conversions are never uploaded.
+/Assets/
+
+# Build output and generated application payloads.
+**/bin/
+**/obj/
+**/publish*/
+/InstallerPayload/
+/InstallerSetupPublish/
+/InstallerSetupDiag*/
+/ToonTwisterNative.exe
+*.pdb
+*.user
+*.suo
+
+# FFmpeg binaries are third-party executables; keep their license/readme only.
+/Encoder/ffmpeg.exe
+/Encoder/ffprobe.exe
+
+# Personal projects and imported media.
+*.ttnative
+/studio-language.txt
+/Assets/UserAudio/
