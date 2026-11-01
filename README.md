@@ -1,10 +1,18 @@
-# Toon Twister 3-D Native Studio — Windows installer
-<img width="1378" height="876" alt="image" src="https://github.com/user-attachments/assets/4347bb3a-979d-4ba0-aee2-35b0d975c2ba" /> <img width="1372" height="907" alt="image" src="https://github.com/user-attachments/assets/6fa5aa3a-b816-4a30-b0c8-74338e7b672b" />
+# Toon Twister 3D: Reimagined — Windows installer
 
+In **Direct**, use **Record voice** to choose a microphone and character, record a line, and add it to the timeline. Recording begins only after pressing Record. Windows microphone access must be enabled. **Speech bubbles** lets you choose a character, text, start time, and duration; bubbles follow the character and camera, appear on their own timeline lane, and are included in video exports. Microphone recordings are stored in the local user audio library; keep those files with your user profile when transferring projects.
+
+The video exporter offers MP4 H.264, MP4 H.265/HEVC, and WebM VP9, at 480p through 2160p and 24, 30, or 60 fps. Choose image quality and encoding speed separately. NVIDIA H.264 encoding is offered after a local encoder test succeeds. GPU encoding speeds up compression; drawing the frames remains a separate part of export. Scene aspect ratios are preserved.
+
+## Publishing updates
+
+The editor checks the latest public GitHub Release at startup and via its Updates button. After the user agrees, it downloads the release ZIP, verifies GitHub's SHA-256 asset digest, and starts Setup. Setup reuses the installed editor's original-game path and language; if the path is unavailable the user selects their own original installation. The editor asks the user to save their work before closing.
+
+The current editor version is **1.1.1**. Publish future updates as a GitHub Release with a higher numeric tag, such as `v1.2.0`, and exactly one ZIP asset. The ZIP must contain `Setup.exe`, `ToonTwisterNative.payload`, and `ffmpeg-win-x64.zip` (they may be in a single folder). Setup must support automatic updates and have file version 1.1.1.0 or newer. Update `CurrentRelease` and the Setup project version for each subsequent release. A GitHub source-code ZIP is not an installer ZIP. Do not include original game assets.
 
 For Windows 11 x64. Download the repository ZIP, choose **Extract all**, and keep the extracted files together. Then double-click **Setup.exe**. The other files are installer payloads; you do not need to open them.
 
-Setup defaults to English, with Dutch available in the language selector. Backgrounds do not receive automatic outlines, and transparent scenery is rendered back to front. Setup asks for a legally obtained original Cartoon Twister 3-D installation and a separate destination folder. It copies the original media locally, converts the 3D models, animations, and supported audio, installs Native Studio and its video encoder, and can launch the editor. It builds the original facial rigs from xml/lipsync.lst and renders the asset selection thumbnails locally. Installation checks both before reporting success. The original game folder remains untouched. Conversion can take a few minutes.
+Setup defaults to English, with Dutch available in the language selector. Backgrounds do not receive automatic outlines, and transparent scenery is rendered back to front. Setup asks for a legally obtained original Cartoon Twister 3-D installation and a separate destination folder. It copies the original media locally, converts the 3D models, animations, and supported audio, installs Toon Twister 3D: Reimagined and its video encoder, and can launch the editor. It builds the original facial rigs from xml/lipsync.lst and renders the asset selection thumbnails locally. Installation checks both before reporting success. The original game folder remains untouched. Conversion can take a few minutes.
 
 ## Keep these files beside Setup.exe
 
@@ -20,6 +28,8 @@ To update an existing Native Studio installation, close the editor and select it
 
 
 Character contours follow the animated surface and exclude the mouth interior. Speech blends original mouth poses smoothly using the same time-based curve for playback, timeline seeking, and video export.
+
+Short original action loops are eased so they no longer flash through a few frames (including Patrick's Yell). Direct also has longer studio actions such as Dramatic yell, Slow nod, and Cheer. On the timeline, drag across empty track space to select multiple clips, then drag one selected clip to move the group. Ctrl-click adds or removes a clip from the selection. Selecting an audio clip reveals its volume slider; its level is saved in the project and applied to MP4 export.
 
 ## Import your own characters
 
@@ -42,3 +52,9 @@ Imported GLB data and character settings are included when you save a .ttnative 
 Select an item in **In your scene** and press **Delete**, or use the **Delete** button below the list. This removes the actor/prop/background from the current scene and removes its attached actions, voice clips, and position keys. The library model and source audio files are kept. Unrelated music stays on the timeline.
 
 **Add to scene** adds the selected character or prop as an independent object; selecting a background replaces the active background. Browsing only previews the selection, and leaving Prep restores the committed scene and camera. Adding characters or props preserves the background camera. Asset cards remain selectable as their thumbnails load; searching first is not required.
+
+
+The editor and setup display the Reimagined logo. Position, height, depth, rotation, and size can be adjusted with live sliders or precise numeric input. Numeric values beyond the initial slider range extend that range.
+
+Patrick's jump deformation is repaired during local conversion from the original installation. A restrained default contour is used for Patrick; the contour thickness remains adjustable in the editor. Existing converted game assets are rebuilt when Setup is run again.
+
